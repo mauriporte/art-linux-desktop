@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""A.R.T. flip clock: Xperia-style 24 h flip clock with weather, drifting against burn-in.
+
+  art-flipclock               show it now (any key, click, touch or mouse move closes it)
+  art-flipclock --daemon      show it after the session's idle delay (run by the user service)
+  art-flipclock --city NAME   change the weather location (Open-Meteo geocoding), then exit
+  art-flipclock --selftest    quick checks, no window
+"""
+import configparser, ctypes, ctypes.util, json, locale, math, os, subprocess, sys, threading, time
+import urllib.parse, urllib.request
+
+CONF = os.path.expanduser("~/.config/art-desktop/config.ini")
+BG, CARD, DIGIT, MUTED, ACCENT = "#050505", "#111111", "#B8B8B8", "#9E9E9E", "#E8650A"
+FONT = "Roboto Condensed"
+
+ES = locale.getlocale()[0] or os.environ.get("LANG", "")
+ES = ES.startswith("es")
+# WMO weather code -> (icon name, English, Spanish)
+WMO = {0: ("weather-clear", "Clear", "Despejado"), 1: ("weather-few-clouds", "Mostly clear", "Poco nuboso"),
+       2: ("weather-few-clouds", "Partly cloudy", "Parcialmente nublado"), 3: ("weather-overcast", "Overcast", "Nublado"),
+       45: ("weather-fog", "Fog", "Niebla"), 48: ("weather-fog", "Fog", "Niebla"),
+       51: ("weather-showers-scattered", "Drizzle", "Llovizna"), 53: ("weather-showers-scattered", "Drizzle", "Llovizna"),
+       55: ("weather-showers-scattered", "Drizzle", "Llovizna"), 61: ("weather-showers", "Light rain", "Lluvia débil"),
+       63: ("weather-showers", "Rain", "Lluvia"), 65: ("weather-showers", "Heavy rain", "Lluvia fuerte"),
+       71: ("weather-snow", "Light snow", "Nieve débil"), 73: ("weather-snow", "Snow", "Nieve"),
+       75: ("weather-snow", "Heavy snow", "Nieve fuerte"), 80: ("weather-showers", "Showers", "Chubascos"),
+       81: ("weather-showers", "Showers", "Chubascos"), 82: ("weather-showers", "Heavy showers", "Chubascos fuertes"),
+       95: ("weather-storm", "Thunderstorm", "Tormenta"), 96: ("weather-storm", "Thunderstorm", "Tormenta"),
+       99: ("weather-storm", "Thunderstorm", "Tormenta")}
+
+
+def wmo(code, day=True):
+    icon, en, es = WMO.get(code, ("weather-overcast", "—", "—"))
+    if not day and icon in ("weather-clear", "weather-few-clouds"):
+        icon += "-night"
+    return icon, es if ES else en
+
+
+def load_conf():
+    c = configparser.ConfigParser()
+    c.read(CONF)
+    if not c.has_section("weather"):
+        c["weather"] = {}
+    return c
+
+
+def get_json(url):
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return json.load(r)
+
+
+def set_city(name):
+    q = urllib.parse.urlencode({"name": name, "count": 1, "language": "es" if ES else "en"})
+    res = get_json("https://geocoding-api.open-meteo.com/v1/search?" + q).get("results")
+    if not res:
+        sys.exit(f"City not found: {name}")
+    r = res[0]
+    c = load_conf()
+    c["weather"].update(city=r["name"], latitude=f"{r['latitude']:.2f}", longitude=f"{r['longitude']:.2f}")
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        c.write(f)
+    print(f"Weather location: {r['name']}, {r.get('country', '')} ({r['latitude']:.2f}, {r['longitude']:.2f})")
+
+
+def fetch_weather():
+    w = load_conf()["weather"]
+    if "latitude" not in w:
+        return None
+    q = urllib.parse.urlencode({"latitude": w["latitude"], "longitude": w["longitude"], "timezone": "auto",
+                                "current": "temperature_2m,weather_code,is_day",
+                                "daily": "temperature_2m_max,temperature_2m_min", "forecast_days": 1})
+    d = get_json("https://api.open-meteo.com/v1/forecast?" + q)
+    cur, day = d["current"], d["daily"]
+    icon, text = wmo(cur["weather_code"], cur["is_day"])
+    return {"city": w.get("city", ""), "temp": round(cur["temperature_2m"]), "icon": icon, "text": text,
+            "hi": round(day["temperature_2m_max"][0]), "lo": round(day["temperature_2m_min"][0])}
+
+
+def drift(t, w, h, bw, bh):
+    """Slow Lissajous offset of the clock block inside the screen (periods of several minutes)."""
+    mx, my = max(0, (w - bw) / 2), max(0, (h - bh) / 2)
+    return mx * math.sin(t / 211.0), my * math.sin(t / 157.0)
+
+
+def layout(w, h):
+    """Card size and block size for a w x h screen: two cards side by side plus a text line."""
+    cw = min(w * 0.34, h * 0.48 / 1.15)
+    ch = cw * 1.15
+    gap = cw * 0.08
+    bw, bh = 2 * cw + gap, ch + h * 0.17
+    return cw, ch, gap, bw, bh
+
+
+def selftest():
+    assert wmo(0)[0] == "weather-clear" and wmo(0, False)[0] == "weather-clear-night"
+    assert wmo(1234)[0] == "weather-overcast"
+    for w, h in ((1024, 600), (1920, 1080), (800, 480)):
+        cw, ch, gap, bw, bh = layout(w, h)
+        assert bw < w and bh < h, (w, h)
+        for t in range(0, 4000, 37):
+            dx, dy = drift(t, w, h, bw, bh)
+            assert 0 <= (w - bw) / 2 + dx and (w - bw) / 2 + dx + bw <= w
+            assert 0 <= (h - bh) / 2 + dy and (h - bh) / 2 + dy + bh <= h
+    print("selftest ok")
+
+
+# ---------------------------------------------------------------- idle watcher (X11 only)
+class XSSInfo(ctypes.Structure):
+    _fields_ = [("window", ctypes.c_ulong), ("state", ctypes.c_int), ("kind", ctypes.c_int),
+                ("til_or_since", ctypes.c_ulong), ("idle", ctypes.c_ulong), ("eventMask", ctypes.c_ulong)]
+
+
+def idle_seconds_fn():
+    x11 = ctypes.cdll.LoadLibrary(ctypes.util.find_library("X11") or "libX11.so.6")
+    xss = ctypes.cdll.LoadLibrary(ctypes.util.find_library("Xss") or "libXss.so.1")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    xss.XScreenSaverAllocInfo.restype = ctypes.POINTER(XSSInfo)
+    xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(XSSInfo)]
+    dpy = x11.XOpenDisplay(None)
+    if not dpy:
+        sys.exit("No X display")
+    root, info = x11.XDefaultRootWindow(dpy), xss.XScreenSaverAllocInfo()
+
+    def idle():
+        xss.XScreenSaverQueryInfo(dpy, root, info)
+        return info.contents.idle / 1000.0
+    return idle
+
+
+def idle_delay():
+    try:
+        out = subprocess.run(["gsettings", "get", "org.cinnamon.desktop.session", "idle-delay"],
+                             capture_output=True, text=True).stdout.split()[-1]
+        return int(out)
+    except Exception:
+        return 300
+
+
+def fullscreen_app_active():
+    # shortcut: asks xprop for the active window's state; misses apps that fake fullscreen. Fine for video players.
+    try:
+        win = subprocess.run(["xprop", "-root", "_NET_ACTIVE_WINDOW"], capture_output=True, text=True).stdout.split()[-1]
+        st = subprocess.run(["xprop", "-id", win, "_NET_WM_STATE"], capture_output=True, text=True).stdout
+        return "_NET_WM_STATE_FULLSCREEN" in st
+    except Exception:
+        return False
+
+
+def daemon():
+    idle = idle_seconds_fn()
+    me = os.path.abspath(__file__)
+    while True:
+        delay = idle_delay()
+        if delay > 0 and idle() >= delay and not fullscreen_app_active():
+            subprocess.run([sys.executable, me])
+            while idle() >= 1:  # wait for real input before re-arming
+                time.sleep(1)
+        time.sleep(5)
+
+
+# ---------------------------------------------------------------- the clock window
+def run_clock():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("PangoCairo", "1.0")
+    from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
+
+    def rgb(hexstr):
+        c = Gdk.RGBA()
+        c.parse(hexstr)
+        return c
+
+    state = {"shown": time.strftime("%H%M"), "prev": None, "anim0": 0.0, "weather": None, "t0": time.monotonic()}
+
+    def refresh_weather():
+        try:
+            state["weather"] = fetch_weather()
+        except Exception:
+            pass  # offline: keep the last reading
+        return False
+
+    def weather_loop():
+        while True:
+            refresh_weather()
+            time.sleep(900)
+    threading.Thread(target=weather_loop, daemon=True).start()
+
+    win = Gtk.Window(title="A.R.T. flip clock")
+    win.set_app_paintable(True)
+    area = Gtk.DrawingArea()
+    win.add(area)
+    win.fullscreen()
+    win.set_keep_above(True)
+    win.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK |
+                   Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.TOUCH_MASK)
+    started = time.monotonic()
+
+    def close(*_):
+        Gtk.main_quit()
+        return True
+
+    def moved(*_):
+        if time.monotonic() - started > 1.5:  # ignore the pointer settling when the window maps
+            close()
+    win.connect("key-press-event", close)
+    win.connect("button-press-event", close)
+    win.connect("touch-event", close)
+    win.connect("motion-notify-event", moved)
+    win.connect("destroy", Gtk.main_quit)
+    win.connect("realize", lambda w: w.get_window().set_cursor(
+        Gdk.Cursor.new_for_display(w.get_display(), Gdk.CursorType.BLANK_CURSOR)))
+
+    def rounded(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    def card_half(cr, x, y, w, h, text, top, squash=1.0):
+        """Draw the top or bottom half of a card showing text; squash<1 folds it toward the middle."""
+        cr.save()
+        mid = y + h / 2
+        cr.rectangle(x, y if top else mid, w, h / 2)
+        cr.clip()
+        cr.translate(0, mid)
+        cr.scale(1, max(squash, 0.001))
+        cr.translate(0, -mid)
+        cr.set_source_rgba(*rgb(CARD))
+        rounded(cr, x, y, w, h, h * 0.09)
+        cr.fill()
+        lay = PangoCairo.create_layout(cr)
+        lay.set_font_description(Pango.FontDescription(f"{FONT} Bold {int(h * 0.72)}px"))
+        lay.set_text(text, -1)
+        _, log = lay.get_pixel_extents()
+        cr.set_source_rgba(*rgb(DIGIT))
+        cr.move_to(x + (w - log.width) / 2 - log.x, mid - log.height / 2 - log.y)
+        PangoCairo.show_layout(cr, lay)
+        cr.restore()
+
+    def card(cr, x, y, w, h, new, old, p):
+        """Card flipping from old to new; p in [0,1] is the animation progress (1 = done)."""
+        if old is None or old == new or p >= 1:
+            card_half(cr, x, y, w, h, new, True)
+            card_half(cr, x, y, w, h, new, False)
+        else:
+            card_half(cr, x, y, w, h, new, True)
+            card_half(cr, x, y, w, h, old, False)
+            if p < 0.5:
+                card_half(cr, x, y, w, h, old, True, 1 - p * 2)
+            else:
+                card_half(cr, x, y, w, h, new, False, (p - 0.5) * 2)
+        cr.set_source_rgba(0, 0, 0, 1)
+        cr.rectangle(x, y + h / 2 - max(1, h * 0.006), w, max(2, h * 0.012))
+        cr.fill()
+
+    def text(cr, s, size, color, x, y, center=True, weight=""):
+        lay = PangoCairo.create_layout(cr)
+        lay.set_font_description(Pango.FontDescription(f"Roboto {weight} {int(size)}px"))
+        lay.set_text(s, -1)
+        _, log = lay.get_pixel_extents()
+        cr.set_source_rgba(*rgb(color))
+        cr.move_to(x - (log.width / 2 if center else 0) - log.x, y - log.y)
+        PangoCairo.show_layout(cr, lay)
+        return log.width
+
+    def draw(widget, cr):
+        w, h = widget.get_allocated_width(), widget.get_allocated_height()
+        cr.set_source_rgba(*rgb(BG))
+        cr.paint()
+        cw, ch, gap, bw, bh = layout(w, h)
+        dx, dy = drift(time.monotonic() - state["t0"], w, h, bw, bh)
+        x0, y0 = (w - bw) / 2 + dx, (h - bh) / 2 + dy
+        now, prev = state["shown"], state["prev"]
+        p = min(1.0, (time.monotonic() - state["anim0"]) / 0.6)
+        card(cr, x0, y0, cw, ch, now[:2], prev[:2] if prev else None, p)
+        card(cr, x0 + cw + gap, y0, cw, ch, now[2:], prev[2:] if prev else None, p)
+        ty = y0 + ch + h * 0.035
+        date = time.strftime("%A %-d %B")
+        date = date[:1].upper() + date[1:]
+        wx = state["weather"]
+        if not wx:
+            text(cr, date, h * 0.045, MUTED, x0 + bw / 2, ty)
+            return
+        size = h * 0.045
+        info = f"{date}   ·   {wx['text']}  {wx['lo']}° / {wx['hi']}°"
+        # icon + temp in accent, the rest muted, centred as one line
+        icon_px = int(size * 1.3)
+        temp = f"{wx['temp']}°"
+        lay = PangoCairo.create_layout(cr)
+        lay.set_font_description(Pango.FontDescription(f"Roboto Medium {int(size)}px"))
+        lay.set_text(temp, -1)
+        tw = lay.get_pixel_extents()[1].width
+        lay.set_font_description(Pango.FontDescription(f"Roboto {int(size)}px"))
+        lay.set_text(info, -1)
+        iw = lay.get_pixel_extents()[1].width
+        total = icon_px + size * 0.4 + tw + size * 0.8 + iw
+        x = x0 + bw / 2 - total / 2
+        try:
+            ii = Gtk.IconTheme.get_default().lookup_icon(wx["icon"] + "-symbolic", icon_px, 0)
+            pb = ii.load_symbolic(rgb(ACCENT), None, None, None)[0]
+            Gdk.cairo_set_source_pixbuf(cr, pb, x, ty + (size * 1.2 - icon_px) / 2)
+            cr.paint()
+        except Exception:
+            pass
+        x += icon_px + size * 0.4
+        x += text(cr, temp, size, ACCENT, x, ty, False, "Medium") + size * 0.8
+        text(cr, info, size, MUTED, x, ty, False)
+
+    def tick():
+        now = time.strftime("%H%M")
+        if now != state["shown"]:
+            state["prev"], state["shown"], state["anim0"] = state["shown"], now, time.monotonic()
+        area.queue_draw()
+        return True
+
+    def anim():
+        if time.monotonic() - state["anim0"] < 0.7:
+            area.queue_draw()
+        return True
+
+    area.connect("draw", draw)
+    GLib.timeout_add(1000, tick)
+    GLib.timeout_add(16, anim)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    args = sys.argv[1:]
+    if args[:1] == ["--selftest"]:
+        selftest()
+    elif args[:1] == ["--city"] and len(args) > 1:
+        set_city(" ".join(args[1:]))
+    elif args[:1] == ["--daemon"]:
+        daemon()
+    else:
+        run_clock()
