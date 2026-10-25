@@ -17,6 +17,7 @@ More devices for the Remote page (a selector at its top) go in ~/.config/art-des
   [TV]                       Android TV through HA (androidtv_remote): full D-pad
   type = atv
   entity = remote.living_room_tv
+  host = 192.168.1.40         optional: Joint Remote on the TV, for typing and sending links
   [Sound bar]                an HA IR remote with learned commands: Label=command, comma-separated
   type = ir
   entity = remote.ir_blaster
@@ -508,6 +509,34 @@ def run(open_now):
         if r == Gtk.ResponseType.OK and t:
             send(t)
 
+    def ask(title, hint, button):
+        modal["open"] = True
+        dlg = Gtk.Dialog(title=title, transient_for=panel, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, button, Gtk.ResponseType.OK)
+        ent = Gtk.Entry(placeholder_text=hint, activates_default=True)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        dlg.get_content_area().pack_start(ent, True, True, 12)
+        dlg.show_all()
+        r, t = dlg.run(), ent.get_text().strip()
+        dlg.destroy()
+        modal["open"] = False
+        panel.present()
+        return t if r == Gtk.ResponseType.OK else ""
+
+    def paired(d, then):
+        """Runs then() once this device's Joint Remote is paired, pairing first (code shown on the device)."""
+        if d["host"] in jr_store()["peers"]:
+            return then()
+
+        def started(ok):
+            if not ok:
+                return flash(f"{d['name']}: not reachable")
+            code = ask(f"Pair with Joint Remote on {d['name']}", f"6-digit code shown on {d['name']}", "Pair")
+            if code:
+                bg(lambda: jr_pair_finish(d["host"], code) or True,
+                   lambda r: (flash("Paired with " + d["name"]), then()) if r else flash("Pairing failed: try again"))
+        bg(lambda: jr_pair_start(d["host"]) or True, started)
+
     def link_from_clipboard(then):
         def got(_c, t):
             m = re.search(r"https?://\S+", t or "")
@@ -518,6 +547,7 @@ def run(open_now):
         """Joint Remote's remote: round D-pad with OK, a ring of eight buttons, links underneath."""
         press = sender(d)
         jr = d["type"] == "jr"
+        talk = bool(d["host"])  # Joint Remote reachable: typing and links (an Android TV can have both)
 
         def done_msg(msg):
             return lambda r: flash(msg if r else f"{d['name']}: not reachable")
@@ -546,13 +576,13 @@ def run(open_now):
         pad.put(okb, (dp - o) // 2, (dp - o) // 2)
         fx.put(pad, (FACE - dp) // 2, (FACE - dp) // 2)
         r = FACE / 2 - RING / 2 - 4
-        keyboard = ("input-keyboard", "Type", lambda: ask_text(d, lambda t: bg(
-            lambda: jr_send(d["host"], {"type": "text", "text": t}) or True, done_msg("Typed on " + d["name"]))))
+        keyboard = ("input-keyboard", "Type", lambda: paired(d, lambda: ask_text(d, lambda t: bg(
+            lambda: jr_send(d["host"], {"type": "text", "text": t}) or True, done_msg("Typed on " + d["name"])))))
         ring = {0: ("media-playback-start", "Play or pause", lambda: press("play")),
                 45: ("audio-volume-high", "Volume up", lambda: press("vol_up")),
                 90: ("media-skip-forward", "Next", lambda: press("next")),
                 135: ("audio-volume-low", "Volume down, hold to mute", lambda: press("vol_down")),
-                180: keyboard if jr else ("audio-volume-muted", "Mute", lambda: press("mute")),
+                180: keyboard if talk else ("audio-volume-muted", "Mute", lambda: press("mute")),
                 225: ("edit-undo", "Back", lambda: press("back")),
                 270: ("media-skip-backward", "Previous", lambda: press("previous")),
                 315: ("go-home", "Home", lambda: press("home"))}
@@ -567,11 +597,11 @@ def run(open_now):
             fx.put(b, int(x), int(y))
         box.pack_start(fx, False, False, 0)
         links = Gtk.Box(spacing=14, halign=Gtk.Align.CENTER)
-        if jr:
-            links.pack_start(round_button("insert-link", "Paste & send link", lambda: link_from_clipboard(
+        if talk:
+            links.pack_start(round_button("insert-link", "Paste & send link", lambda: paired(d, lambda: link_from_clipboard(
                 lambda u: bg(lambda: jr_send(d["host"], {"type": "link", "url": u}) or True,
-                             done_msg("Link copied on " + d["name"]))), RING), False, False, 0)
-        else:
+                             done_msg("Link copied on " + d["name"])))), RING), False, False, 0)
+        if not jr:
             links.pack_start(round_button("go-jump", "Paste & open on the TV", lambda: link_from_clipboard(
                 lambda u: bg(lambda: ha.call("remote", "turn_on", {"entity_id": d["entity"], "activity": u}) or True,
                              done_msg("Opening on " + d["name"]))), RING), False, False, 0)
