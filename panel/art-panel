@@ -794,6 +794,17 @@ def run(open_now):
     tab.add(tb)
     tab.set_app_paintable(True)
     tab.show_all()
+    showing = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "art-flipclock.showing")
+
+    def clock_watch():
+        """Hide the edge tab while the flip clock screensaver is up (the tab would float over it)."""
+        up = os.path.exists(showing)
+        if up and tab.get_visible():
+            tab.hide()
+        elif not up and not tab.get_visible() and not panel.get_visible():
+            tab.show_all()
+        return True
+    GLib.timeout_add_seconds(1, clock_watch)
     pc = configparser.ConfigParser()
     pc.read(PANEL_CONF)
     if open_now or pc.getboolean("panel", "pinned", fallback=False):

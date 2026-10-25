@@ -11,6 +11,7 @@ import configparser, ctypes, ctypes.util, json, locale, math, os, subprocess, sy
 import urllib.parse, urllib.request
 
 CONF = os.path.expanduser("~/.config/art-desktop/config.ini")
+SHOWING = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "art-flipclock.showing")
 BG, CARD, DIGIT, MUTED, ACCENT = "#050505", "#111111", "#B8B8B8", "#9E9E9E", "#E8650A"
 FONT = "Roboto Condensed"
 
@@ -89,7 +90,7 @@ def layout(w, h):
     cw = min(w * 0.34, h * 0.48 / 1.15)
     ch = cw * 1.15
     gap = cw * 0.08
-    bw, bh = 2 * cw + gap, ch + h * 0.17
+    bw, bh = 2 * cw + gap, ch  # the info line sits below, between the cards and the screen edge
     return cw, ch, gap, bw, bh
 
 
@@ -175,7 +176,7 @@ def run_clock():
     gi.require_version("Gtk", "3.0")
     gi.require_version("Gdk", "3.0")
     gi.require_version("PangoCairo", "1.0")
-    from gi.repository import Gdk, GLib, Gtk, Pango, PangoCairo
+    from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango, PangoCairo
 
     def rgb(hexstr):
         c = Gdk.RGBA()
@@ -277,10 +278,31 @@ def run_clock():
         PangoCairo.show_layout(cr, lay)
         return log.width
 
+    def wallpaper():
+        """The desktop wallpaper, if one is set (drawn behind the cards so the clock sits on it)."""
+        try:
+            bg = Gio.Settings.new("org.cinnamon.desktop.background")
+            uri = bg.get_string("picture-uri")
+            if bg.get_string("picture-options") == "none" or not uri:
+                return None
+            return GdkPixbuf.Pixbuf.new_from_file(Gio.File.new_for_uri(uri).get_path())
+        except Exception:
+            return None
+    wall = {"src": wallpaper(), "scaled": None}
+
     def draw(widget, cr):
         w, h = widget.get_allocated_width(), widget.get_allocated_height()
         cr.set_source_rgba(*rgb(BG))
         cr.paint()
+        src = wall["src"]
+        if src:
+            if not wall["scaled"] or wall["scaled"][0] != (w, h):
+                k = max(w / src.get_width(), h / src.get_height())  # zoom to cover, like Cinnamon's "zoom"
+                sw, sh = round(src.get_width() * k), round(src.get_height() * k)
+                wall["scaled"] = ((w, h), src.scale_simple(sw, sh, GdkPixbuf.InterpType.BILINEAR), (w - sw) / 2, (h - sh) / 2)
+            _, pb, ox, oy = wall["scaled"]
+            Gdk.cairo_set_source_pixbuf(cr, pb, ox, oy)
+            cr.paint()
         cw, ch, gap, bw, bh = layout(w, h)
         dx, dy = drift(time.monotonic() - state["t0"], w, h, bw, bh)
         x0, y0 = (w - bw) / 2 + dx, (h - bh) / 2 + dy
@@ -288,7 +310,7 @@ def run_clock():
         p = min(1.0, (time.monotonic() - state["anim0"]) / 0.6)
         card(cr, x0, y0, cw, ch, now[:2], prev[:2] if prev else None, p)
         card(cr, x0 + cw + gap, y0, cw, ch, now[2:], prev[2:] if prev else None, p)
-        ty = y0 + ch + h * 0.035
+        ty = (y0 + ch + h) / 2 - h * 0.045 * 0.6  # centred between the cards' bottom and the screen's bottom
         date = time.strftime("%A %-d %B")
         date = date[:1].upper() + date[1:]
         wx = state["weather"]
@@ -336,7 +358,14 @@ def run_clock():
     GLib.timeout_add(1000, tick)
     GLib.timeout_add(16, anim)
     win.show_all()
-    Gtk.main()
+    open(SHOWING, "w").close()  # tells the slide-in panel to hide its edge tab meanwhile
+    try:
+        Gtk.main()
+    finally:
+        try:
+            os.unlink(SHOWING)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
