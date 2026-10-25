@@ -12,10 +12,28 @@ Music and Remote talk to Home Assistant and appear only when ~/.config/art-deskt
   music = media_player.spotify
   remote = remote.living_room_tv
 Weather uses Open-Meteo and the city set with: art-flipclock --city NAME (or the panel's city button).
+
+More devices for the Remote page (a selector at its top) go in ~/.config/art-desktop/remotes.ini, one section each:
+  [TV]                       Android TV through HA (androidtv_remote): full D-pad
+  type = atv
+  entity = remote.living_room_tv
+  [Sound bar]                an HA IR remote with learned commands: Label=command, comma-separated
+  type = ir
+  entity = remote.ir_blaster
+  device = soundbar
+  commands = Power=power, Vol +=volume_up, Vol -=volume_down
+  [Tablet]                   an Android device running Joint Remote (pairs once with a code shown on it)
+  type = jr
+  host = 192.168.1.50
+Without remotes.ini, the [ha] remote entity is used as a single Android TV.
 """
-import configparser, importlib.machinery, json, os, sys, threading, time, urllib.parse, urllib.request
+import base64, configparser, hashlib, hmac, importlib.machinery, json, os, secrets, socket, sys, threading, time
+import urllib.parse, urllib.request
 
 HA_CONF = os.path.expanduser("~/.config/art-desktop/ha.ini")
+REMOTES = os.path.expanduser("~/.config/art-desktop/remotes.ini")
+JR_STORE = os.path.expanduser("~/.config/art-desktop/joint-remote.json")
+JR_PORT = 8733
 FLIP = os.path.join(os.path.dirname(os.path.realpath(__file__)), "art-flipclock")
 WIDTH = 360
 CSS = b"""
@@ -25,11 +43,15 @@ CSS = b"""
 .art-big { font-size: 34px; font-weight: 500; color: #e8650a; }
 .art-title { font-size: 17px; font-weight: 500; color: #f2f2f2; }
 .art-muted { color: #9e9e9e; }
-.art-round { border-radius: 999px; min-width: 64px; min-height: 64px; background: #1c1c1e; border: none; box-shadow: none; }
+.art-round { border-radius: 999px; min-width: 64px; min-height: 64px; background: #2a2a2d; border: none; box-shadow: none; }
 .art-round:active, .art-round:checked { background: #e8650a; }
 .art-ok { min-width: 84px; min-height: 84px; }
 .art-nav button { border: none; background: none; box-shadow: none; color: #9e9e9e; padding: 10px 18px; }
 .art-nav button:checked { color: #e8650a; }
+.art-chip { border-radius: 999px; padding: 6px 14px; background: #1c1c1e; border: none; box-shadow: none; color: #c9cbd3; }
+.art-chip:checked { background: #e8650a; color: #050505; }
+.art-key { border-radius: 12px; min-height: 52px; background: #2a2a2d; border: none; box-shadow: none; }
+.art-key:active { background: #e8650a; color: #050505; }
 """
 
 # Android TV key names for HA's remote.send_command (androidtv_remote integration)
@@ -38,8 +60,84 @@ REMOTE_KEYS = {"up": "DPAD_UP", "down": "DPAD_DOWN", "left": "DPAD_LEFT", "right
                "vol_down": "VOLUME_DOWN", "mute": "VOLUME_MUTE", "vol_up": "VOLUME_UP"}
 
 
+# Joint Remote key names (its Receiver), for the same buttons
+JR_KEYS = {"up": "up", "down": "down", "left": "left", "right": "right", "ok": "center", "back": "back",
+           "home": "home", "play": "play_pause", "vol_down": "volume_down", "mute": "mute", "vol_up": "volume_up",
+           "recents": "recents", "next": "next", "previous": "previous"}
+
+
 def flip():
     return importlib.machinery.SourceFileLoader("artflip", FLIP).load_module()
+
+
+def load_devices(ha, path=REMOTES):
+    c = configparser.ConfigParser()
+    c.optionxform = str
+    c.read(path)
+    devs = []
+    for name in c.sections():
+        s = c[name]
+        d = {"name": name, "type": s.get("type", "atv"), "entity": s.get("entity", ""), "device": s.get("device", ""),
+             "host": s.get("host", "")}
+        d["commands"] = [tuple(x.strip() for x in p.split("=", 1)) if "=" in p else (p.strip(), p.strip())
+                         for p in s.get("commands", "").split(",") if p.strip()]
+        devs.append(d)
+    if not devs and ha.ok and ha.remote:
+        devs.append({"name": "TV", "type": "atv", "entity": ha.remote, "device": "", "host": "", "commands": []})
+    return [d for d in devs if d["type"] == "jr" or ha.ok]
+
+
+# ---- Joint Remote client (protocol: joint-remote Receiver.kt / Auth.kt)
+def jr_sign(secret, method, path, t, nonce, body):
+    msg = f"{method}\n{path}\n{t}\n{nonce}\n{body}".encode()
+    return base64.b64encode(hmac.new(secret, msg, hashlib.sha256).digest()).decode()
+
+
+def jr_store():
+    try:
+        with open(JR_STORE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    if "id" not in st:
+        st["id"] = base64.urlsafe_b64encode(secrets.token_bytes(9)).decode()
+    st.setdefault("peers", {})
+    return st
+
+
+def jr_save(st):
+    fd = os.open(JR_STORE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(st, f)
+
+
+def jr_post(host, path, body, headers=None):
+    r = urllib.request.Request(f"http://{host}:{JR_PORT}{path}", data=body.encode(), method="POST",
+                               headers={"Content-Type": "application/json", **(headers or {})})
+    with urllib.request.urlopen(r, timeout=6) as f:
+        return json.loads(f.read() or b"{}")
+
+
+def jr_pair_start(host):
+    jr_post(host, "/pair/start", "{}")
+
+
+def jr_pair_finish(host, code):
+    st = jr_store()
+    mine = {"id": st["id"], "name": socket.gethostname(), "kind": "desktop", "code": code.strip()}
+    j = jr_post(host, "/pair/finish", json.dumps(mine))
+    st["peers"][host] = {"name": j.get("name", host), "secret": j["secret"]}
+    jr_save(st)
+
+
+def jr_send(host, cmd):
+    st = jr_store()
+    peer = st["peers"].get(host)
+    if not peer:
+        raise RuntimeError("not paired")
+    body, t, nonce = json.dumps(cmd), int(time.time() * 1000), secrets.token_urlsafe(12)
+    sig = jr_sign(base64.b64decode(peer["secret"]), "POST", "/cmd", t, nonce, body)
+    jr_post(host, "/cmd", body, {"x-id": st["id"], "x-time": str(t), "x-nonce": nonce, "x-sig": sig})
 
 
 class HA:
@@ -79,6 +177,17 @@ def selftest():
     assert h.ok and h.url == "http://x:8123" and h.music == "media_player.m" and h.remote == ""
     assert not HA("/nonexistent").ok
     assert set(REMOTE_KEYS.values()) >= {"DPAD_CENTER", "BACK", "HOME"}
+    with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as f:
+        f.write("[Sound bar]\ntype = ir\nentity = remote.x\ndevice = sb\ncommands = Power=power, Vol +=vol_up, mute\n"
+                "[Tab]\ntype = jr\nhost = 10.0.0.5\n")
+    devs = load_devices(h, f.name)
+    os.unlink(f.name)
+    assert [d["name"] for d in devs] == ["Sound bar", "Tab"]
+    assert devs[0]["commands"] == [("Power", "power"), ("Vol +", "vol_up"), ("mute", "mute")]
+    assert [d["type"] for d in load_devices(HA("/nonexistent"), "/nonexistent")] == []
+    # same HMAC as Joint Remote's Auth.sign: base64(HmacSHA256(secret, "method\npath\ntime\nnonce\nbody"))
+    sig = jr_sign(b"k" * 32, "POST", "/cmd", 1, "abcdefgh", "{}")
+    assert sig == base64.b64encode(hmac.new(b"k" * 32, b"POST\n/cmd\n1\nabcdefgh\n{}", hashlib.sha256).digest()).decode()
     print("selftest ok")
 
 
@@ -269,28 +378,145 @@ def run(open_now):
             show_weather(None)
         return False
 
-    # ---- Remote page
-    remote = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-    rc = card()
+    # ---- Remote page: a device selector on top, one control page per device
+    devices = load_devices(ha)
+    remote = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    chips = Gtk.Box(spacing=6)
+    chips.get_style_context().add_class("art-chips")
+    chip_scroll = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER)
+    chip_scroll.add(chips)
+    chip_scroll.set_min_content_height(44)
+    dstack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=120)
+    remote.pack_start(chip_scroll, False, False, 0)
+    remote.pack_start(dstack, True, True, 0)
+    status = label("", "art-muted", 0.5)
+    remote.pack_end(status, False, False, 0)
 
-    def key(k):
-        return lambda: bg(lambda: ha.call("remote", "send_command", {"entity_id": ha.remote, "command": REMOTE_KEYS[k]}))
-    pad = Gtk.Grid(row_spacing=8, column_spacing=8, halign=Gtk.Align.CENTER)
-    pad.attach(icon_button("pan-up", key("up")), 1, 0, 1, 1)
-    pad.attach(icon_button("pan-start", key("left")), 0, 1, 1, 1)
-    okb = icon_button("media-record", key("ok"))
-    okb.get_style_context().add_class("art-ok")
-    pad.attach(okb, 1, 1, 1, 1)
-    pad.attach(icon_button("pan-end", key("right")), 2, 1, 1, 1)
-    pad.attach(icon_button("pan-down", key("down")), 1, 2, 1, 1)
-    row1, row2 = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER), Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
-    for name, k in (("edit-undo", "back"), ("go-home", "home"), ("media-playback-start", "play")):
-        row1.pack_start(icon_button(name, key(k)), False, False, 0)
-    for name, k in (("audio-volume-low", "vol_down"), ("audio-volume-muted", "mute"), ("audio-volume-high", "vol_up")):
-        row2.pack_start(icon_button(name, key(k)), False, False, 0)
-    for w in (pad, row1, row2):
-        rc.pack_start(w, False, False, 4)
-    remote.pack_start(rc, False, False, 0)
+    def flash(msg):
+        status.set_text(msg)
+        GLib.timeout_add_seconds(4, lambda: status.set_text("") or False)
+
+    def sender(d):
+        """Returns press(k) for a device: k is a REMOTE_KEYS name, or a raw command for IR devices."""
+        def done(res):
+            if res is None:
+                flash(f"{d['name']}: not reachable")
+        if d["type"] == "atv":
+            return lambda k: bg(lambda: ha.call("remote", "send_command",
+                                                {"entity_id": d["entity"], "command": REMOTE_KEYS[k]}) or True, done)
+        if d["type"] == "ir":
+            def ir(k):
+                data = {"entity_id": d["entity"], "command": k}
+                if d["device"]:
+                    data["device"] = d["device"]
+                bg(lambda: ha.call("remote", "send_command", data) or True, done)
+            return ir
+        return lambda k: bg(lambda: jr_send(d["host"], {"type": "key", "key": JR_KEYS[k]}) or True, done)
+
+    def dpad_page(d, extra_rows):
+        press = sender(d)
+        box = card()
+        pad = Gtk.Grid(row_spacing=8, column_spacing=8, halign=Gtk.Align.CENTER)
+        pad.attach(icon_button("pan-up", lambda: press("up")), 1, 0, 1, 1)
+        pad.attach(icon_button("pan-start", lambda: press("left")), 0, 1, 1, 1)
+        okb = icon_button("media-record", lambda: press("ok"))
+        okb.get_style_context().add_class("art-ok")
+        pad.attach(okb, 1, 1, 1, 1)
+        pad.attach(icon_button("pan-end", lambda: press("right")), 2, 1, 1, 1)
+        pad.attach(icon_button("pan-down", lambda: press("down")), 1, 2, 1, 1)
+        box.pack_start(pad, False, False, 4)
+        for row in extra_rows:
+            r = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
+            for name, k in row:
+                r.pack_start(icon_button(name, lambda k=k: press(k)), False, False, 0)
+            box.pack_start(r, False, False, 4)
+        return box
+
+    tv_rows = [(("edit-undo", "back"), ("go-home", "home"), ("media-playback-start", "play")),
+               (("audio-volume-low", "vol_down"), ("audio-volume-muted", "mute"), ("audio-volume-high", "vol_up"))]
+    jr_rows = [(("edit-undo", "back"), ("go-home", "home"), ("view-grid", "recents")),
+               (("media-skip-backward", "previous"), ("media-playback-start", "play"), ("media-skip-forward", "next")),
+               (("audio-volume-low", "vol_down"), ("audio-volume-muted", "mute"), ("audio-volume-high", "vol_up"))]
+
+    def ir_page(d):
+        press = sender(d)
+        box = card()
+        grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, min_children_per_line=2, max_children_per_line=3,
+                           homogeneous=True, row_spacing=8, column_spacing=8)
+        for lab, cmd in d["commands"]:
+            b = Gtk.Button()
+            bl = Gtk.Label(label=lab, wrap=True, max_width_chars=9, justify=Gtk.Justification.CENTER)
+            b.add(bl)
+            b.get_style_context().add_class("art-key")
+            b.connect("clicked", lambda _b, c=cmd: press(c))
+            grid.add(b)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.add(grid)
+        box.pack_start(sc, True, True, 0)
+        return box
+
+    def jr_page(d):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        if d["host"] in jr_store()["peers"]:
+            outer.pack_start(dpad_page(d, jr_rows), False, False, 0)
+            return outer
+        box = card()
+        box.pack_start(label(f"Pair with Joint Remote on {d['name']}", "art-title"), False, False, 0)
+        box.pack_start(label("Tap Pair: a 6-digit code appears on the device. Type it here.", "art-muted"), False, False, 0)
+        code = Gtk.Entry(placeholder_text="6-digit code", input_purpose=Gtk.InputPurpose.DIGITS, max_length=6)
+        pair = Gtk.Button(label="Pair")
+        pair.get_style_context().add_class("suggested-action")
+
+        def start(*_):
+            bg(lambda: jr_pair_start(d["host"]) or True,
+               lambda r: flash("Code shown on " + d["name"]) if r else flash(f"{d['name']}: not reachable"))
+            code.grab_focus()
+
+        def finish(*_):
+            c = code.get_text().strip()
+            if len(c) != 6:
+                return
+
+            def ok(r):
+                if r:
+                    for ch in outer.get_children():
+                        outer.remove(ch)
+                    outer.pack_start(dpad_page(d, jr_rows), False, False, 0)
+                    outer.show_all()
+                    flash("Paired with " + d["name"])
+                else:
+                    flash("Pairing failed: tap Pair for a new code")
+            bg(lambda: jr_pair_finish(d["host"], c) or True, ok)
+        pair.connect("clicked", start)
+        code.connect("activate", finish)
+        box.pack_start(pair, False, False, 0)
+        box.pack_start(code, False, False, 0)
+        outer.pack_start(box, False, False, 0)
+        return outer
+
+    chip_buttons = []
+    for i, d in enumerate(devices):
+        page = dpad_page(d, tv_rows) if d["type"] == "atv" else ir_page(d) if d["type"] == "ir" else jr_page(d)
+        dstack.add_named(page, str(i))
+        cb = Gtk.ToggleButton(label=d["name"])
+        cb.get_style_context().add_class("art-chip")
+        chip_buttons.append(cb)
+        chips.pack_start(cb, False, False, 0)
+
+    def pick(idx):
+        dstack.set_visible_child_name(str(idx))
+        for j, b in enumerate(chip_buttons):
+            if b.get_active() != (j == idx):
+                b.handler_block_by_func(on_chip)
+                b.set_active(j == idx)
+                b.handler_unblock_by_func(on_chip)
+
+    def on_chip(b):
+        pick(chip_buttons.index(b))
+    for b in chip_buttons:
+        b.connect("toggled", on_chip)
+    if devices:
+        pick(0)
 
     # ---- the panel window: pages in a stack, swipe or tap the nav to switch
     stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT, transition_duration=220)
@@ -298,7 +524,7 @@ def run(open_now):
     if ha.ok and ha.music:
         pages.append(("music", "Music", "music-notes", music))
     pages.append(("weather", "Weather", "weather-few-clouds", weather))
-    if ha.ok and ha.remote:
+    if devices:
         pages.append(("remote", "Remote", "television", remote))
     nav = Gtk.Box(homogeneous=True)
     nav.get_style_context().add_class("art-nav")
@@ -377,6 +603,7 @@ def run(open_now):
     def show():
         tab.hide()
         panel.show_all()
+        panel.move(geo.x + geo.width - panel.get_size()[0], geo.y)  # stay flush right even if content widened it
         panel.present()
         refresh_music()
         refresh_weather()
