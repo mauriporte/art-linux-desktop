@@ -37,7 +37,7 @@ JR_PORT = 8733
 FLIP = os.path.join(os.path.dirname(os.path.realpath(__file__)), "art-flipclock")
 WIDTH = 360
 CSS = b"""
-.art-panel { background-color: #050505; border-left: 1px solid #1c1c1e; }
+.art-panel { background-color: transparent; }
 .art-card { background-color: #1c1c1e; border-radius: 16px; padding: 14px; }
 .art-tab { background-color: rgba(232, 101, 10, 0.75); border-radius: 6px 0 0 6px; }
 .art-big { font-size: 34px; font-weight: 500; color: #e8650a; }
@@ -55,9 +55,9 @@ CSS = b"""
 .art-dpad { background: #1c1c1e; border-radius: 999px; }
 .art-arrow { background: transparent; border: none; box-shadow: none; border-radius: 999px; }
 .art-arrow:active { background: rgba(232, 101, 10, 0.35); }
-.art-ring { background: #2a2a2d; border: none; box-shadow: none; border-radius: 999px; padding: 0; }
+.art-ring { background: #1c1c1e; border: none; box-shadow: none; border-radius: 999px; padding: 0; }
 .art-ring:active { background: #e8650a; }
-.art-okring { background: #2a2a2d; border: 2px solid #e8650a; box-shadow: none; border-radius: 999px; color: #ffffff; font-size: 18px; }
+.art-okring { background: #2c2c2e; border: 2px solid #e8650a; box-shadow: none; border-radius: 999px; color: #ffffff; font-size: 18px; }
 .art-okring:active { background: #e8650a; }
 """
 
@@ -390,7 +390,7 @@ def run(open_now):
     remote = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
     chips = Gtk.Box(spacing=6)
     chips.get_style_context().add_class("art-chips")
-    chip_scroll = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER)
+    chip_scroll = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER, hscrollbar_policy=Gtk.PolicyType.EXTERNAL)
     chip_scroll.add(chips)
     chip_scroll.set_min_content_height(44)
     dstack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=120)
@@ -628,6 +628,19 @@ def run(open_now):
     panel.set_default_size(WIDTH, geo.height)
     panel.move(geo.x + geo.width - WIDTH, geo.y)
     panel.get_style_context().add_class("art-panel")
+    # see-through like Joint Remote's own screen: the wallpaper shows between the cards and buttons (needs a compositor)
+    rgba = scr.get_rgba_visual()
+    if rgba and scr.is_composited():
+        panel.set_visual(rgba)
+        panel.set_app_paintable(True)
+
+        def clear(_w, cr):
+            cr.set_source_rgba(0, 0, 0, 0)
+            cr.set_operator(0)  # CAIRO_OPERATOR_CLEAR
+            cr.paint()
+            cr.set_operator(2)  # back to OVER for the children
+            return False
+        panel.connect("draw", clear)
     body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
     head = Gtk.Box()
     head.pack_start(nav, True, True, 0)
