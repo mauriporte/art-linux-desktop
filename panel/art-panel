@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""A.R.T. slide-in panel for touch screens: Music, Weather and Remote pages you swipe between.
+
+  art-panel            a thin tab on the right edge; tap or swipe it to slide the panel in
+  art-panel --open     open the panel now
+  art-panel --selftest quick checks, no window
+
+Music and Remote talk to Home Assistant and appear only when ~/.config/art-desktop/ha.ini exists:
+  [ha]
+  url = http://homeassistant.local:8123
+  token = <long-lived access token, keep this file mode 600>
+  music = media_player.spotify
+  remote = remote.living_room_tv
+Weather uses Open-Meteo and the city set with: art-flipclock --city NAME (or the panel's city button).
+"""
+import configparser, importlib.machinery, json, os, sys, threading, time, urllib.parse, urllib.request
+
+HA_CONF = os.path.expanduser("~/.config/art-desktop/ha.ini")
+FLIP = os.path.join(os.path.dirname(os.path.realpath(__file__)), "art-flipclock")
+WIDTH = 360
+CSS = b"""
+.art-panel { background-color: #050505; border-left: 1px solid #1c1c1e; }
+.art-card { background-color: #1c1c1e; border-radius: 16px; padding: 14px; }
+.art-tab { background-color: rgba(232, 101, 10, 0.75); border-radius: 6px 0 0 6px; }
+.art-big { font-size: 34px; font-weight: 500; color: #e8650a; }
+.art-title { font-size: 17px; font-weight: 500; color: #f2f2f2; }
+.art-muted { color: #9e9e9e; }
+.art-round { border-radius: 999px; min-width: 64px; min-height: 64px; background: #1c1c1e; border: none; box-shadow: none; }
+.art-round:active, .art-round:checked { background: #e8650a; }
+.art-ok { min-width: 84px; min-height: 84px; }
+.art-nav button { border: none; background: none; box-shadow: none; color: #9e9e9e; padding: 10px 18px; }
+.art-nav button:checked { color: #e8650a; }
+"""
+
+# Android TV key names for HA's remote.send_command (androidtv_remote integration)
+REMOTE_KEYS = {"up": "DPAD_UP", "down": "DPAD_DOWN", "left": "DPAD_LEFT", "right": "DPAD_RIGHT",
+               "ok": "DPAD_CENTER", "back": "BACK", "home": "HOME", "play": "MEDIA_PLAY_PAUSE",
+               "vol_down": "VOLUME_DOWN", "mute": "VOLUME_MUTE", "vol_up": "VOLUME_UP"}
+
+
+def flip():
+    return importlib.machinery.SourceFileLoader("artflip", FLIP).load_module()
+
+
+class HA:
+    def __init__(self, path=HA_CONF):
+        c = configparser.ConfigParser()
+        c.read(path)
+        s = c["ha"] if c.has_section("ha") else {}
+        self.url, self.token = s.get("url", "").rstrip("/"), s.get("token", "")
+        self.music, self.remote = s.get("music", ""), s.get("remote", "")
+
+    @property
+    def ok(self):
+        return bool(self.url and self.token)
+
+    def _req(self, path, body=None):
+        r = urllib.request.Request(self.url + path, data=None if body is None else json.dumps(body).encode(),
+                                   headers={"Authorization": "Bearer " + self.token, "Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=8) as f:
+            return f.read()
+
+    def state(self, entity):
+        return json.loads(self._req("/api/states/" + entity))
+
+    def call(self, domain, service, data):
+        self._req(f"/api/services/{domain}/{service}", data)
+
+    def image(self, rel):
+        return self._req(rel) if rel.startswith("/") else urllib.request.urlopen(rel, timeout=8).read()
+
+
+def selftest():
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False) as f:
+        f.write("[ha]\nurl = http://x:8123/\ntoken = t\nmusic = media_player.m\n")
+    h = HA(f.name)
+    os.unlink(f.name)
+    assert h.ok and h.url == "http://x:8123" and h.music == "media_player.m" and h.remote == ""
+    assert not HA("/nonexistent").ok
+    assert set(REMOTE_KEYS.values()) >= {"DPAD_CENTER", "BACK", "HOME"}
+    print("selftest ok")
+
+
+def run(open_now):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
+
+    prov = Gtk.CssProvider()
+    prov.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    ha = HA()
+    fl = flip()
+    scr = Gdk.Screen.get_default()
+    geo = scr.get_display().get_primary_monitor().get_workarea()
+
+    def bg(fn, done=None):
+        """Run fn in a thread, hand its result (or None on error) to done on the GTK thread."""
+        def work():
+            try:
+                res = fn()
+            except Exception as e:
+                print("art-panel:", e, file=sys.stderr)
+                res = None
+            if done:
+                GLib.idle_add(done, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def label(text="", cls=None, xalign=0.0):
+        lb = Gtk.Label(label=text, xalign=xalign)
+        lb.set_ellipsize(3)
+        if cls:
+            lb.get_style_context().add_class(cls)
+        return lb
+
+    def icon_button(name, cb, cls="art-round", size=Gtk.IconSize.LARGE_TOOLBAR):
+        b = Gtk.Button()
+        b.set_image(Gtk.Image.new_from_icon_name(name + "-symbolic", size))
+        b.get_style_context().add_class(cls)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def card():
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.get_style_context().add_class("art-card")
+        return box
+
+    # ---- Music page
+    music = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    mc = card()
+    cover = Gtk.Image.new_from_icon_name("multimedia-audio-player", Gtk.IconSize.DIALOG)
+    cover.set_size_request(200, 200)
+    m_title, m_artist = label("—", "art-title", 0.5), label("", "art-muted", 0.5)
+    ctrl = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
+    vol = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
+    vol.set_draw_value(False)
+    mstate = {"pic": None, "busy_vol": False}
+
+    def mcall(service, extra=None):
+        bg(lambda: ha.call("media_player", service, dict(entity_id=ha.music, **(extra or {}))),
+           lambda _: GLib.timeout_add(700, refresh_music) and False)
+    for name, svc in (("media-skip-backward", "media_previous_track"), ("media-playback-start", "media_play_pause"),
+                      ("media-skip-forward", "media_next_track")):
+        ctrl.pack_start(icon_button(name, lambda s=svc: mcall(s)), False, False, 0)
+
+    def vol_changed(s):
+        if not mstate["busy_vol"]:
+            mcall("volume_set", {"volume_level": round(s.get_value(), 2)})
+    vol.connect("value-changed", vol_changed)
+    for w in (cover, m_title, m_artist, ctrl, vol):
+        mc.pack_start(w, False, False, 0)
+    music.pack_start(mc, False, False, 0)
+
+    def show_music(st):
+        if not st:
+            return False
+        a = st.get("attributes", {})
+        m_title.set_text(a.get("media_title") or st.get("state", "").capitalize())
+        m_artist.set_text(a.get("media_artist") or a.get("friendly_name", ""))
+        mstate["busy_vol"] = True
+        vol.set_value(a.get("volume_level") or 0)
+        mstate["busy_vol"] = False
+        pic = a.get("entity_picture")
+        if pic and pic != mstate["pic"]:
+            mstate["pic"] = pic
+
+            def got(data):
+                if data:
+                    ld = GdkPixbuf.PixbufLoader()
+                    ld.write(data)
+                    ld.close()
+                    cover.set_from_pixbuf(ld.get_pixbuf().scale_simple(200, 200, GdkPixbuf.InterpType.BILINEAR))
+            bg(lambda: ha.image(pic), got)
+        return False
+
+    def refresh_music():
+        if ha.ok and ha.music:
+            bg(lambda: ha.state(ha.music), show_music)
+        return False
+
+    # ---- Weather page
+    weather = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    wc = card()
+    w_top = Gtk.Box(spacing=12)
+    w_icon = Gtk.Image()
+    w_temp, w_text, w_city = label("--°", "art-big"), label("", "art-title"), Gtk.Button(label="")
+    w_city.set_relief(Gtk.ReliefStyle.NONE)
+    w_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    w_col.pack_start(w_text, False, False, 0)
+    w_col.pack_start(w_city, False, False, 0)
+    w_top.pack_start(w_icon, False, False, 0)
+    w_top.pack_start(w_temp, False, False, 0)
+    w_top.pack_start(w_col, True, True, 0)
+    hours, days = Gtk.Box(spacing=4, homogeneous=True), Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    for w in (w_top, hours):
+        wc.pack_start(w, False, False, 0)
+    dc = card()
+    dc.pack_start(days, False, False, 0)
+    weather.pack_start(wc, False, False, 0)
+    weather.pack_start(dc, False, False, 0)
+
+    pop = Gtk.Popover.new(w_city)
+    pbox = Gtk.Box(spacing=6, margin=8)
+    entry = Gtk.Entry(placeholder_text="City")
+    pbox.pack_start(entry, True, True, 0)
+    pop.add(pbox)
+    pbox.show_all()
+
+    def set_city(*_):
+        name = entry.get_text().strip()
+        if name:
+            pop.popdown()
+            bg(lambda: fl.set_city(name), lambda _: refresh_weather())
+    entry.connect("activate", set_city)
+    w_city.connect("clicked", lambda *_: (pop.popup(), entry.grab_focus()))
+
+    def wicon(name, px):
+        return Gtk.Image.new_from_icon_name(name + "-symbolic", Gtk.IconSize.LARGE_TOOLBAR) if px < 40 else \
+            Gtk.Image.new_from_icon_name(name + "-symbolic", Gtk.IconSize.DIALOG)
+
+    def fetch_forecast():
+        w = fl.load_conf()["weather"]
+        q = urllib.parse.urlencode({"latitude": w["latitude"], "longitude": w["longitude"], "timezone": "auto",
+                                    "current": "temperature_2m,weather_code,is_day",
+                                    "hourly": "temperature_2m,weather_code", "forecast_hours": 7,
+                                    "daily": "weather_code,temperature_2m_max,temperature_2m_min", "forecast_days": 5})
+        d = fl.get_json("https://api.open-meteo.com/v1/forecast?" + q)
+        d["city"] = w.get("city", "")
+        return d
+
+    def show_weather(d):
+        if not d:
+            w_city.set_label("Set a city")
+            return False
+        cur = d["current"]
+        icon, text = fl.wmo(cur["weather_code"], cur["is_day"])
+        w_icon.set_from_icon_name(icon + "-symbolic", Gtk.IconSize.DIALOG)
+        w_temp.set_text(f"{round(cur['temperature_2m'])}°")
+        w_text.set_text(text)
+        w_city.set_label(d["city"] or "Set a city")
+        for box in (hours, days):
+            for ch in box.get_children():
+                box.remove(ch)
+        h = d["hourly"]
+        for t, temp, code in list(zip(h["time"], h["temperature_2m"], h["weather_code"]))[1:7]:
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            col.pack_start(label(t[11:13] + "h", "art-muted", 0.5), False, False, 0)
+            col.pack_start(wicon(fl.wmo(code)[0], 24), False, False, 0)
+            col.pack_start(label(f"{round(temp)}°", None, 0.5), False, False, 0)
+            hours.pack_start(col, True, True, 0)
+        dd = d["daily"]
+        for t, code, hi, lo in zip(dd["time"], dd["weather_code"], dd["temperature_2m_max"], dd["temperature_2m_min"]):
+            row = Gtk.Box(spacing=10)
+            day = time.strftime("%a", time.strptime(t, "%Y-%m-%d"))
+            row.pack_start(label(day, None), False, False, 0)
+            row.pack_start(wicon(fl.wmo(code)[0], 24), False, False, 0)
+            row.pack_start(label(fl.wmo(code)[1], "art-muted"), True, True, 0)
+            row.pack_start(label(f"{round(lo)}° / {round(hi)}°", None, 1.0), False, False, 0)
+            days.pack_start(row, False, False, 0)
+        weather.show_all()
+        return False
+
+    def refresh_weather():
+        if "latitude" in fl.load_conf()["weather"]:
+            bg(fetch_forecast, show_weather)
+        else:
+            show_weather(None)
+        return False
+
+    # ---- Remote page
+    remote = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    rc = card()
+
+    def key(k):
+        return lambda: bg(lambda: ha.call("remote", "send_command", {"entity_id": ha.remote, "command": REMOTE_KEYS[k]}))
+    pad = Gtk.Grid(row_spacing=8, column_spacing=8, halign=Gtk.Align.CENTER)
+    pad.attach(icon_button("pan-up", key("up")), 1, 0, 1, 1)
+    pad.attach(icon_button("pan-start", key("left")), 0, 1, 1, 1)
+    okb = icon_button("media-record", key("ok"))
+    okb.get_style_context().add_class("art-ok")
+    pad.attach(okb, 1, 1, 1, 1)
+    pad.attach(icon_button("pan-end", key("right")), 2, 1, 1, 1)
+    pad.attach(icon_button("pan-down", key("down")), 1, 2, 1, 1)
+    row1, row2 = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER), Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
+    for name, k in (("edit-undo", "back"), ("go-home", "home"), ("media-playback-start", "play")):
+        row1.pack_start(icon_button(name, key(k)), False, False, 0)
+    for name, k in (("audio-volume-low", "vol_down"), ("audio-volume-muted", "mute"), ("audio-volume-high", "vol_up")):
+        row2.pack_start(icon_button(name, key(k)), False, False, 0)
+    for w in (pad, row1, row2):
+        rc.pack_start(w, False, False, 4)
+    remote.pack_start(rc, False, False, 0)
+
+    # ---- the panel window: pages in a stack, swipe or tap the nav to switch
+    stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT, transition_duration=220)
+    pages = []
+    if ha.ok and ha.music:
+        pages.append(("music", "Music", "music-notes", music))
+    pages.append(("weather", "Weather", "weather-few-clouds", weather))
+    if ha.ok and ha.remote:
+        pages.append(("remote", "Remote", "television", remote))
+    nav = Gtk.Box(homogeneous=True)
+    nav.get_style_context().add_class("art-nav")
+    radios = {}
+    for pid, title, icon, w in pages:
+        stack.add_titled(w, pid, title)
+        rb = Gtk.ToggleButton(label=title)
+        rb.connect("toggled", lambda b, p=pid: b.get_active() and stack.set_visible_child_name(p))
+        radios[pid] = rb
+        nav.pack_start(rb, True, True, 0)
+
+    def sync_nav(*_):
+        cur = stack.get_visible_child_name()
+        for pid, rb in radios.items():
+            rb.set_active(pid == cur)
+    stack.connect("notify::visible-child-name", sync_nav)
+
+    panel = Gtk.Window(type_hint=Gdk.WindowTypeHint.UTILITY, decorated=False, skip_taskbar_hint=True,
+                       skip_pager_hint=True)
+    panel.set_keep_above(True)
+    panel.set_default_size(WIDTH, geo.height)
+    panel.move(geo.x + geo.width - WIDTH, geo.y)
+    panel.get_style_context().add_class("art-panel")
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
+    head = Gtk.Box()
+    head.pack_start(nav, True, True, 0)
+    head.pack_start(icon_button("window-close", lambda: hide(), "flat", Gtk.IconSize.BUTTON), False, False, 0)
+    body.pack_start(head, False, False, 0)
+    body.pack_start(stack, True, True, 0)
+    evb = Gtk.EventBox()
+    evb.add(body)
+    panel.add(evb)
+
+    # HA configured but no token yet: let the user paste it here, so it never travels anywhere else
+    if ha.url and not ha.token:
+        hc = card()
+        hc.pack_start(label("Connect Home Assistant for Music and Remote", "art-muted"), False, False, 0)
+        tok = Gtk.Entry(placeholder_text="Paste a long-lived access token", visibility=False)
+        hc.pack_start(tok, False, False, 0)
+
+        def save_token(*_):
+            t = tok.get_text().strip()
+            if not t:
+                return
+            c = configparser.ConfigParser()
+            c.read(HA_CONF)
+            c["ha"]["token"] = t
+            fd = os.open(HA_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                c.write(f)
+            os.execv(sys.executable, [sys.executable, os.path.realpath(__file__), "--open"])
+        tok.connect("activate", save_token)
+        weather.pack_end(hc, False, False, 0)
+
+    swipe = Gtk.GestureSwipe.new(evb)
+    swipe.set_touch_only(False)
+
+    def swiped(g, vx, vy):
+        if abs(vx) < 300 or abs(vx) < abs(vy):
+            return
+        names = [p[0] for p in pages]
+        i = names.index(stack.get_visible_child_name())
+        if vx > 0 and i == 0:
+            hide()  # swipe right on the first page closes the panel
+        elif 0 <= i + (1 if vx < 0 else -1) < len(names):
+            stack.set_visible_child_name(names[i + (1 if vx < 0 else -1)])
+    swipe.connect("swipe", swiped)
+    panel._swipe = swipe  # keep the gesture alive
+
+    timer = {"id": None}
+
+    def poll():
+        refresh_music()
+        return True
+
+    def show():
+        tab.hide()
+        panel.show_all()
+        panel.present()
+        refresh_music()
+        refresh_weather()
+        timer["id"] = GLib.timeout_add_seconds(10, poll)  # gentle on Home Assistant
+
+    def hide():
+        panel.hide()
+        if timer["id"]:
+            GLib.source_remove(timer["id"])
+            timer["id"] = None
+        tab.show_all()
+    panel.connect("delete-event", lambda *_: hide() or True)
+    panel.connect("focus-out-event", lambda *_: (not pop.get_visible()) and hide() or False)
+
+    # ---- the edge tab
+    tab = Gtk.Window(type=Gtk.WindowType.POPUP)
+    tab.set_default_size(14, 110)
+    tab.move(geo.x + geo.width - 14, geo.y + (geo.height - 110) // 2)
+    tb = Gtk.EventBox()
+    tb.get_style_context().add_class("art-tab")
+    tb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.TOUCH_MASK)
+    tb.connect("button-press-event", lambda *_: show())
+    tb.connect("touch-event", lambda w, e: e.type == Gdk.EventType.TOUCH_BEGIN and show())
+    tab.add(tb)
+    tab.set_app_paintable(True)
+    tab.show_all()
+    if open_now:
+        show()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["--selftest"]:
+        selftest()
+    else:
+        run(a[:1] == ["--open"])

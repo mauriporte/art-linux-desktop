@@ -132,6 +132,15 @@ fc-cache -f "$FONTS" >/dev/null 2>&1 || true
 # ---- 5. flip clock: replaces Cinnamon's idle blank screen, same idle delay
 mkdir -p "$HOME/.local/bin" "$HOME/.config/autostart" "$HOME/.local/share/applications"
 install -m 755 "$HERE/flipclock/art-flipclock" "$HOME/.local/bin/art-flipclock"
+install -m 755 "$HERE/panel/art-panel" "$HOME/.local/bin/art-panel"
+cat > "$HOME/.config/autostart/art-panel.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=A.R.T. slide-in panel
+Exec=$HOME/.local/bin/art-panel
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF
 cat > "$HOME/.config/autostart/art-flipclock.desktop" <<EOF
 [Desktop Entry]
 Type=Application
@@ -178,8 +187,10 @@ gsettings set org.gnome.desktop.interface font-name "Roboto $size" 2>/dev/null |
 
 # start the idle watcher now (autostart takes over from the next login)
 pkill -u "$USER" -f '[a]rt-flipclock --daemon' 2>/dev/null || true
+pkill -u "$USER" -f '[a]rt-panel' 2>/dev/null || true
 if [ -n "${DISPLAY:-}" ]; then
-  setsid nohup "$HOME/.local/bin/art-flipclock" --daemon >/dev/null 2>&1 &
+  setsid nohup "$HOME/.local/bin/art-flipclock" --daemon >/dev/null 2>&1 < /dev/null &
+  setsid nohup "$HOME/.local/bin/art-panel" >/dev/null 2>&1 < /dev/null &
 fi
 
 echo "A.R.T. look installed. Try the clock: art-flipclock   Change city: art-flipclock --city \"Madrid\""
