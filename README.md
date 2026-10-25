@@ -7,7 +7,7 @@ A dark, quiet look for the **Cinnamon** desktop (Debian 13), matching the A.R.T.
 - **ART-Phosphor** icons: [Phosphor](https://phosphoricons.com) outline icons (MIT) in soft grey; anything missing falls back to Adwaita.
 - **Roboto / Roboto Condensed** fonts (OFL), your current font size kept.
 - **Flip-clock screensaver**: 24-hour flip cards with the weather ([Open-Meteo](https://open-meteo.com), no account),
-  drifting slowly against burn-in. Any key, click, touch or mouse move closes it. It starts after Cinnamon's idle delay
+  centred on your wallpaper (`art-flipclock --drift on` makes it drift slowly against burn-in). Any key, click, touch or mouse move closes it. It starts after Cinnamon's idle delay
   (System Settings → Screensaver) and skips full-screen apps such as videos.
 - **Slide-in panel for touch screens**: tap the small orange tab on the right edge (or click it) and swipe between
   *Weather* (now, next hours, five days, change city with a tap), and, when Home Assistant is set up, *Music*

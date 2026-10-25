@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""A.R.T. flip clock: Xperia-style 24 h flip clock with weather, drifting against burn-in.
+"""A.R.T. flip clock: Xperia-style 24 h flip clock with weather, centred (optional drift against burn-in).
 
   art-flipclock               show it now (any key, click, touch or mouse move closes it)
   art-flipclock --daemon      show it after the session's idle delay (run by the user service)
   art-flipclock --city NAME   change the weather location (Open-Meteo geocoding), then exit
   art-flipclock --idle SECS   change how long the desktop must be idle before the clock shows (0 = never)
+  art-flipclock --drift on|off   slow drift against burn-in, or stay centred (default)
   art-flipclock --selftest    quick checks, no window
 """
 import configparser, ctypes, ctypes.util, json, locale, math, os, subprocess, sys, threading, time
@@ -90,7 +91,7 @@ def layout(w, h):
     cw = min(w * 0.34, h * 0.48 / 1.15)
     ch = cw * 1.15
     gap = cw * 0.08
-    bw, bh = 2 * cw + gap, ch  # the info line sits below, between the cards and the screen edge
+    bw, bh = 2 * cw + gap, ch + (h - ch) / 4 + h * 0.03  # cards, a gap, then the info line: centred as one block
     return cw, ch, gap, bw, bh
 
 
@@ -289,6 +290,7 @@ def run_clock():
         except Exception:
             return None
     wall = {"src": wallpaper(), "scaled": None}
+    moving = load_conf().getboolean("clock", "drift", fallback=False)  # stays centred; on = slow drift against burn-in
 
     def draw(widget, cr):
         w, h = widget.get_allocated_width(), widget.get_allocated_height()
@@ -304,13 +306,13 @@ def run_clock():
             Gdk.cairo_set_source_pixbuf(cr, pb, ox, oy)
             cr.paint()
         cw, ch, gap, bw, bh = layout(w, h)
-        dx, dy = drift(time.monotonic() - state["t0"], w, h, bw, bh)
+        dx, dy = drift(time.monotonic() - state["t0"], w, h, bw, bh) if moving else (0, 0)
         x0, y0 = (w - bw) / 2 + dx, (h - bh) / 2 + dy
         now, prev = state["shown"], state["prev"]
         p = min(1.0, (time.monotonic() - state["anim0"]) / 0.6)
         card(cr, x0, y0, cw, ch, now[:2], prev[:2] if prev else None, p)
         card(cr, x0 + cw + gap, y0, cw, ch, now[2:], prev[2:] if prev else None, p)
-        ty = (y0 + ch + h) / 2 - h * 0.045 * 0.6  # centred between the cards' bottom and the screen's bottom
+        ty = y0 + ch + (h - ch) / 4 - h * 0.045 * 0.6
         date = time.strftime("%A %-d %B")
         date = date[:1].upper() + date[1:]
         wx = state["weather"]
@@ -387,6 +389,15 @@ if __name__ == "__main__":
         with open(CONF, "w") as f:
             c.write(f)
         print(f"Flip clock after {args[1]} s idle")
+    elif args[:1] == ["--drift"] and args[1:2] in (["on"], ["off"]):
+        c = load_conf()
+        if not c.has_section("clock"):
+            c["clock"] = {}
+        c["clock"]["drift"] = "true" if args[1] == "on" else "false"
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF, "w") as f:
+            c.write(f)
+        print("Drift", args[1])
     elif args[:1] == ["--daemon"]:
         daemon()
     else:
