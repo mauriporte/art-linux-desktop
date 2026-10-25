@@ -245,3 +245,4 @@ status system-shutdown power
 status avatar-default user-circle
 actions insert-link link-simple
 actions go-jump arrow-square-out
+actions view-pin push-pin

@@ -27,12 +27,14 @@ More devices for the Remote page (a selector at its top) go in ~/.config/art-des
   host = 192.168.1.50
 Without remotes.ini, the [ha] remote entity is used as a single Android TV.
 """
-import base64, configparser, hashlib, hmac, importlib.machinery, json, math, os, re, secrets, socket, sys, threading, time
+import base64, configparser, hashlib, hmac, importlib.machinery, json, math, os, re, secrets, socket, subprocess, sys, \
+    threading, time
 import urllib.parse, urllib.request
 
 HA_CONF = os.path.expanduser("~/.config/art-desktop/ha.ini")
 REMOTES = os.path.expanduser("~/.config/art-desktop/remotes.ini")
 JR_STORE = os.path.expanduser("~/.config/art-desktop/joint-remote.json")
+PANEL_CONF = os.path.expanduser("~/.config/art-desktop/panel.ini")
 JR_PORT = 8733
 FLIP = os.path.join(os.path.dirname(os.path.realpath(__file__)), "art-flipclock")
 WIDTH = 360
@@ -52,6 +54,8 @@ CSS = b"""
 .art-chip:checked { background: #e8650a; color: #050505; }
 .art-key { border-radius: 12px; min-height: 52px; background: #2a2a2d; border: none; box-shadow: none; }
 .art-key:active { background: #e8650a; color: #050505; }
+.art-pin { background: none; border: none; box-shadow: none; color: #9e9e9e; }
+.art-pin:checked { color: #e8650a; }
 .art-dpad { background: #1c1c1e; border-radius: 999px; }
 .art-arrow { background: transparent; border: none; box-shadow: none; border-radius: 999px; }
 .art-arrow:active { background: rgba(232, 101, 10, 0.35); }
@@ -210,7 +214,7 @@ def run(open_now):
     ha = HA()
     fl = flip()
     scr = Gdk.Screen.get_default()
-    geo = scr.get_display().get_primary_monitor().get_workarea()
+    geo = scr.get_display().get_primary_monitor().get_geometry()  # the whole side, top to bottom
 
     def bg(fn, done=None):
         """Run fn in a thread, hand its result (or None on error) to done on the GTK thread."""
@@ -626,6 +630,7 @@ def run(open_now):
                        skip_pager_hint=True)
     panel.set_keep_above(True)
     panel.set_default_size(WIDTH, geo.height)
+    panel.set_size_request(WIDTH, geo.height)
     panel.move(geo.x + geo.width - WIDTH, geo.y)
     panel.get_style_context().add_class("art-panel")
     # see-through like Joint Remote's own screen: the wallpaper shows between the cards and buttons (needs a compositor)
@@ -644,7 +649,13 @@ def run(open_now):
     body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
     head = Gtk.Box()
     head.pack_start(nav, True, True, 0)
-    head.pack_start(icon_button("window-close", lambda: hide(), "flat", Gtk.IconSize.BUTTON), False, False, 0)
+    pin = Gtk.ToggleButton()
+    pin.set_image(Gtk.Image.new_from_icon_name("view-pin-symbolic", Gtk.IconSize.BUTTON))
+    pin.set_tooltip_text("Pin: keep the panel open and make room for it")
+    pin.get_style_context().add_class("art-pin")
+    head.pack_start(pin, False, False, 0)
+    head.pack_start(icon_button("window-close", lambda: (pin.set_active(False), hide()), "flat", Gtk.IconSize.BUTTON),
+                    False, False, 0)
     body.pack_start(head, False, False, 0)
     body.pack_start(stack, True, True, 0)
     evb = Gtk.EventBox()
@@ -681,7 +692,8 @@ def run(open_now):
         names = [p[0] for p in pages]
         i = names.index(stack.get_visible_child_name())
         if vx > 0 and i == 0:
-            hide()  # swipe right on the first page closes the panel
+            if not pin.get_active():
+                hide()  # swipe right on the first page closes the panel (unless pinned)
         elif 0 <= i + (1 if vx < 0 else -1) < len(names):
             stack.set_visible_child_name(names[i + (1 if vx < 0 else -1)])
     swipe.connect("swipe", swiped)
@@ -709,7 +721,36 @@ def run(open_now):
             timer["id"] = None
         tab.show_all()
     panel.connect("delete-event", lambda *_: hide() or True)
-    panel.connect("focus-out-event", lambda *_: (not pop.get_visible() and not modal["open"]) and hide() or False)
+    panel.connect("focus-out-event",
+                  lambda *_: (not pin.get_active() and not pop.get_visible() and not modal["open"]) and hide() or False)
+
+    def strut(on):
+        """Reserve the right edge (like a dock) so maximised windows stop at the pinned panel."""
+        xid = str(panel.get_window().get_xid())
+        w = panel.get_size()[0]
+        if on:
+            for prop, val in (("_NET_WM_STRUT", f"0, {w}, 0, 0"),
+                              ("_NET_WM_STRUT_PARTIAL", f"0, {w}, 0, 0, 0, 0, 0, {geo.height - 1}, 0, 0, 0, 0")):
+                subprocess.run(["xprop", "-id", xid, "-f", prop, "32c", "-set", prop, val], check=False)
+        else:
+            for prop in ("_NET_WM_STRUT", "_NET_WM_STRUT_PARTIAL"):
+                subprocess.run(["xprop", "-id", xid, "-remove", prop], check=False)
+
+    def pinned(b):
+        on = b.get_active()
+        # only a dock may sit inside the space it reserves; the type can only change while unmapped
+        was = panel.get_visible()
+        panel.hide()
+        panel.set_type_hint(Gdk.WindowTypeHint.DOCK if on else Gdk.WindowTypeHint.UTILITY)
+        if on or was:
+            show()
+        panel.set_keep_above(not on)
+        strut(on)
+        c = configparser.ConfigParser()
+        c["panel"] = {"pinned": str(on).lower()}
+        with open(PANEL_CONF, "w") as f:
+            c.write(f)
+    pin.connect("toggled", pinned)
 
     # ---- the edge tab
     tab = Gtk.Window(type=Gtk.WindowType.POPUP)
@@ -723,8 +764,12 @@ def run(open_now):
     tab.add(tb)
     tab.set_app_paintable(True)
     tab.show_all()
-    if open_now:
+    pc = configparser.ConfigParser()
+    pc.read(PANEL_CONF)
+    if open_now or pc.getboolean("panel", "pinned", fallback=False):
         show()
+    if pc.getboolean("panel", "pinned", fallback=False):
+        pin.set_active(True)
     Gtk.main()
 
 
