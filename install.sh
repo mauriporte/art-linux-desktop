@@ -46,6 +46,7 @@ KEYS=(
   "org.cinnamon.desktop.background picture-options"
   "org.cinnamon.desktop.background primary-color"
   "org.cinnamon.desktop.screensaver idle-activation-enabled"
+  "org.cinnamon.desktop.session idle-delay"
   "org.gnome.desktop.interface gtk-theme"
   "org.gnome.desktop.interface icon-theme"
   "org.gnome.desktop.interface color-scheme"
@@ -180,6 +181,14 @@ gsettings set org.cinnamon.desktop.interface font-name "Roboto $size"
 gsettings set org.cinnamon.desktop.wm.preferences titlebar-font "Roboto Medium $size"
 gsettings set org.cinnamon.theme name ART-Dark
 gsettings set org.cinnamon.desktop.screensaver idle-activation-enabled false
+# Cinnamon 6.4 starts its own screensaver on session idle whatever idle-activation says, covering the flip clock:
+# the clock takes over the idle delay (kept from Cinnamon's) and Cinnamon's idle timer goes off
+if ! grep -q '^\[clock\]' "$HOME/.config/art-desktop/config.ini" 2>/dev/null; then
+  d="$(gsettings get org.cinnamon.desktop.session idle-delay | awk '{print $NF}')"
+  [ "${d:-0}" -gt 0 ] 2>/dev/null || d=300
+  "$HOME/.local/bin/art-flipclock" --idle "$d" >/dev/null
+fi
+gsettings set org.cinnamon.desktop.session idle-delay 0
 gsettings set org.gnome.desktop.interface gtk-theme ART-Dark 2>/dev/null || true
 gsettings set org.gnome.desktop.interface icon-theme ART-Phosphor 2>/dev/null || true
 gsettings set org.gnome.desktop.interface color-scheme prefer-dark 2>/dev/null || true
