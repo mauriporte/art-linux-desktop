@@ -27,7 +27,7 @@ More devices for the Remote page (a selector at its top) go in ~/.config/art-des
   host = 192.168.1.50
 Without remotes.ini, the [ha] remote entity is used as a single Android TV.
 """
-import base64, configparser, hashlib, hmac, importlib.machinery, json, os, secrets, socket, sys, threading, time
+import base64, configparser, hashlib, hmac, importlib.machinery, json, math, os, re, secrets, socket, sys, threading, time
 import urllib.parse, urllib.request
 
 HA_CONF = os.path.expanduser("~/.config/art-desktop/ha.ini")
@@ -52,6 +52,13 @@ CSS = b"""
 .art-chip:checked { background: #e8650a; color: #050505; }
 .art-key { border-radius: 12px; min-height: 52px; background: #2a2a2d; border: none; box-shadow: none; }
 .art-key:active { background: #e8650a; color: #050505; }
+.art-dpad { background: #1c1c1e; border-radius: 999px; }
+.art-arrow { background: transparent; border: none; box-shadow: none; border-radius: 999px; }
+.art-arrow:active { background: rgba(232, 101, 10, 0.35); }
+.art-ring { background: #2a2a2d; border: none; box-shadow: none; border-radius: 999px; padding: 0; }
+.art-ring:active { background: #e8650a; }
+.art-okring { background: #2a2a2d; border: 2px solid #e8650a; box-shadow: none; border-radius: 999px; color: #ffffff; font-size: 18px; }
+.art-okring:active { background: #e8650a; }
 """
 
 # Android TV key names for HA's remote.send_command (androidtv_remote integration)
@@ -413,31 +420,6 @@ def run(open_now):
             return ir
         return lambda k: bg(lambda: jr_send(d["host"], {"type": "key", "key": JR_KEYS[k]}) or True, done)
 
-    def dpad_page(d, extra_rows):
-        press = sender(d)
-        box = card()
-        pad = Gtk.Grid(row_spacing=8, column_spacing=8, halign=Gtk.Align.CENTER)
-        pad.attach(icon_button("pan-up", lambda: press("up")), 1, 0, 1, 1)
-        pad.attach(icon_button("pan-start", lambda: press("left")), 0, 1, 1, 1)
-        okb = icon_button("media-record", lambda: press("ok"))
-        okb.get_style_context().add_class("art-ok")
-        pad.attach(okb, 1, 1, 1, 1)
-        pad.attach(icon_button("pan-end", lambda: press("right")), 2, 1, 1, 1)
-        pad.attach(icon_button("pan-down", lambda: press("down")), 1, 2, 1, 1)
-        box.pack_start(pad, False, False, 4)
-        for row in extra_rows:
-            r = Gtk.Box(spacing=16, halign=Gtk.Align.CENTER)
-            for name, k in row:
-                r.pack_start(icon_button(name, lambda k=k: press(k)), False, False, 0)
-            box.pack_start(r, False, False, 4)
-        return box
-
-    tv_rows = [(("edit-undo", "back"), ("go-home", "home"), ("media-playback-start", "play")),
-               (("audio-volume-low", "vol_down"), ("audio-volume-muted", "mute"), ("audio-volume-high", "vol_up"))]
-    jr_rows = [(("edit-undo", "back"), ("go-home", "home"), ("view-grid", "recents")),
-               (("media-skip-backward", "previous"), ("media-playback-start", "play"), ("media-skip-forward", "next")),
-               (("audio-volume-low", "vol_down"), ("audio-volume-muted", "mute"), ("audio-volume-high", "vol_up"))]
-
     def ir_page(d):
         press = sender(d)
         box = card()
@@ -458,7 +440,7 @@ def run(open_now):
     def jr_page(d):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         if d["host"] in jr_store()["peers"]:
-            outer.pack_start(dpad_page(d, jr_rows), False, False, 0)
+            outer.pack_start(face(d), False, False, 0)
             return outer
         box = card()
         box.pack_start(label(f"Pair with Joint Remote on {d['name']}", "art-title"), False, False, 0)
@@ -481,8 +463,7 @@ def run(open_now):
                 if r:
                     for ch in outer.get_children():
                         outer.remove(ch)
-                    outer.pack_start(dpad_page(d, jr_rows), False, False, 0)
-                    outer.pack_start(share_card(d), False, False, 0)
+                    outer.pack_start(face(d), False, False, 0)
                     outer.show_all()
                     flash("Paired with " + d["name"])
                 else:
@@ -495,63 +476,107 @@ def run(open_now):
         outer.pack_start(box, False, False, 0)
         return outer
 
+    FACE, RING = 320, 58
     clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+    modal = {"open": False}  # a dialog is up: don't slide the panel away when it takes focus
 
-    def share_card(d):
-        """Text and links: Joint Remote devices get Type / Send link, an Android TV gets Open link (via HA)."""
-        box = card()
-        entry = Gtk.Entry(placeholder_text="Text or link (from the clipboard)")
-        box.pack_start(entry, False, False, 0)
-        row = Gtk.Box(spacing=8, homogeneous=True)
-        box.pack_start(row, False, False, 0)
+    def round_button(icon, tip, cb, size, cls="art-ring"):
+        b = Gtk.Button()
+        b.set_image(Gtk.Image.new_from_icon_name(icon + "-symbolic", Gtk.IconSize.LARGE_TOOLBAR))
+        b.set_tooltip_text(tip)
+        b.set_size_request(size, size)
+        b.get_style_context().add_class(cls)
+        b.connect("clicked", lambda *_: cb())
+        return b
 
-        def is_link(s):
-            return s.startswith(("http://", "https://"))
+    def ask_text(d, send):
+        modal["open"] = True
+        dlg = Gtk.Dialog(title=f"Type for {d['name']}", transient_for=panel, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Send", Gtk.ResponseType.OK)
+        ent = Gtk.Entry(placeholder_text="Sent in one go to the focused field", activates_default=True)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        dlg.get_content_area().pack_start(ent, True, True, 12)
+        dlg.show_all()
+        r, t = dlg.run(), ent.get_text()
+        dlg.destroy()
+        modal["open"] = False
+        panel.present()
+        if r == Gtk.ResponseType.OK and t:
+            send(t)
 
-        def go(what):
-            s = entry.get_text().strip()
-            if not s:
-                return
-            if what != "text" and not is_link(s):
-                flash("Links must start with http:// or https://")
-                return
+    def link_from_clipboard(then):
+        def got(_c, t):
+            m = re.search(r"https?://\S+", t or "")
+            then(m.group(0)) if m else flash("No link on the clipboard")
+        clip.request_text(got)
 
-            def done(r):
-                if r:
-                    flash({"text": "Typed on ", "link": "Link sent to ", "open": "Opening on "}[what] + d["name"])
-                    entry.set_text("")
-                else:
-                    flash(f"{d['name']}: not reachable")
-            if what == "open":
-                bg(lambda: ha.call("remote", "turn_on", {"entity_id": d["entity"], "activity": s}) or True, done)
-            else:
-                cmd = {"type": "text", "text": s} if what == "text" else {"type": "link", "url": s}
-                bg(lambda: jr_send(d["host"], cmd) or True, done)
-        buttons = [("Open link", "open")] if d["type"] == "atv" else [("Type text", "text"), ("Send link", "link")]
-        for lab, what in buttons:
-            b = Gtk.Button(label=lab)
-            b.get_style_context().add_class("art-key")
-            b.connect("clicked", lambda _b, w=what: go(w))
-            row.pack_start(b, True, True, 0)
-        # prefill from the desktop clipboard whenever the page is shown
-        box.connect("map", lambda *_: entry.get_text() or clip.request_text(
-            lambda _c, t: t and entry.set_text(t.strip()[:2000])))
+    def face(d):
+        """Joint Remote's remote: round D-pad with OK, a ring of eight buttons, links underneath."""
+        press = sender(d)
+        jr = d["type"] == "jr"
+
+        def done_msg(msg):
+            return lambda r: flash(msg if r else f"{d['name']}: not reachable")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        fx = Gtk.Fixed(halign=Gtk.Align.CENTER)
+        fx.set_size_request(FACE, FACE)
+        dp = int(FACE * 0.56)
+        pad = Gtk.Fixed()
+        pad.set_size_request(dp, dp)
+
+        def disc(_w, cr):  # Gtk.Fixed draws no CSS background: paint the round pad ourselves
+            cr.set_source_rgb(0x1c / 255, 0x1c / 255, 0x1e / 255)
+            cr.arc(dp / 2, dp / 2, dp / 2, 0, 2 * math.pi)
+            cr.fill()
+            return False
+        pad.connect("draw", disc)
+        a = int(dp * 0.30)
+        for icon, k, x, y in (("pan-up", "up", (dp - a) // 2, 0), ("pan-down", "down", (dp - a) // 2, dp - a),
+                              ("pan-start", "left", 0, (dp - a) // 2), ("pan-end", "right", dp - a, (dp - a) // 2)):
+            pad.put(round_button(icon, k, lambda k=k: press(k), a, "art-arrow"), x, y)
+        o = int(dp * 0.38)
+        okb = Gtk.Button(label="OK")
+        okb.set_size_request(o, o)
+        okb.get_style_context().add_class("art-okring")
+        okb.connect("clicked", lambda *_: press("ok"))
+        pad.put(okb, (dp - o) // 2, (dp - o) // 2)
+        fx.put(pad, (FACE - dp) // 2, (FACE - dp) // 2)
+        r = FACE / 2 - RING / 2 - 4
+        keyboard = ("input-keyboard", "Type", lambda: ask_text(d, lambda t: bg(
+            lambda: jr_send(d["host"], {"type": "text", "text": t}) or True, done_msg("Typed on " + d["name"]))))
+        ring = {0: ("media-playback-start", "Play or pause", lambda: press("play")),
+                45: ("audio-volume-high", "Volume up", lambda: press("vol_up")),
+                90: ("media-skip-forward", "Next", lambda: press("next")),
+                135: ("audio-volume-low", "Volume down, hold to mute", lambda: press("vol_down")),
+                180: keyboard if jr else ("audio-volume-muted", "Mute", lambda: press("mute")),
+                225: ("edit-undo", "Back", lambda: press("back")),
+                270: ("media-skip-backward", "Previous", lambda: press("previous")),
+                315: ("go-home", "Home", lambda: press("home"))}
+        for deg, (icon, tip, cb) in ring.items():
+            b = round_button(icon, tip, cb, RING)
+            if deg == 135:
+                lp = Gtk.GestureLongPress.new(b)
+                lp.connect("pressed", lambda *_: press("mute"))
+                b._lp = lp
+            x = FACE / 2 + r * math.sin(math.radians(deg)) - RING / 2
+            y = FACE / 2 - r * math.cos(math.radians(deg)) - RING / 2
+            fx.put(b, int(x), int(y))
+        box.pack_start(fx, False, False, 0)
+        links = Gtk.Box(spacing=14, halign=Gtk.Align.CENTER)
+        if jr:
+            links.pack_start(round_button("insert-link", "Paste & send link", lambda: link_from_clipboard(
+                lambda u: bg(lambda: jr_send(d["host"], {"type": "link", "url": u}) or True,
+                             done_msg("Link copied on " + d["name"]))), RING), False, False, 0)
+        else:
+            links.pack_start(round_button("go-jump", "Paste & open on the TV", lambda: link_from_clipboard(
+                lambda u: bg(lambda: ha.call("remote", "turn_on", {"entity_id": d["entity"], "activity": u}) or True,
+                             done_msg("Opening on " + d["name"]))), RING), False, False, 0)
+        box.pack_start(links, False, False, 0)
         return box
-
-    def with_share(d, page):
-        if d["type"] == "ir" or (d["type"] == "jr" and d["host"] not in jr_store()["peers"]):
-            return page
-        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        col.pack_start(page, False, False, 0)
-        col.pack_start(share_card(d), False, False, 0)
-        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        sc.add(col)
-        return sc
 
     chip_buttons = []
     for i, d in enumerate(devices):
-        page = dpad_page(d, tv_rows) if d["type"] == "atv" else ir_page(d) if d["type"] == "ir" else jr_page(d)
-        page = with_share(d, page)
+        page = face(d) if d["type"] == "atv" else ir_page(d) if d["type"] == "ir" else jr_page(d)
         dstack.add_named(page, str(i))
         cb = Gtk.ToggleButton(label=d["name"])
         cb.get_style_context().add_class("art-chip")
@@ -671,7 +696,7 @@ def run(open_now):
             timer["id"] = None
         tab.show_all()
     panel.connect("delete-event", lambda *_: hide() or True)
-    panel.connect("focus-out-event", lambda *_: (not pop.get_visible()) and hide() or False)
+    panel.connect("focus-out-event", lambda *_: (not pop.get_visible() and not modal["open"]) and hide() or False)
 
     # ---- the edge tab
     tab = Gtk.Window(type=Gtk.WindowType.POPUP)

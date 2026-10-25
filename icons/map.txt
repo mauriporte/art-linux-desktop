@@ -243,3 +243,5 @@ status keyboard-brightness sun-dim
 status display-brightness sun
 status system-shutdown power
 status avatar-default user-circle
+actions insert-link link-simple
+actions go-jump arrow-square-out
