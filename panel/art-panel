@@ -482,6 +482,7 @@ def run(open_now):
                     for ch in outer.get_children():
                         outer.remove(ch)
                     outer.pack_start(dpad_page(d, jr_rows), False, False, 0)
+                    outer.pack_start(share_card(d), False, False, 0)
                     outer.show_all()
                     flash("Paired with " + d["name"])
                 else:
@@ -494,9 +495,63 @@ def run(open_now):
         outer.pack_start(box, False, False, 0)
         return outer
 
+    clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+
+    def share_card(d):
+        """Text and links: Joint Remote devices get Type / Send link, an Android TV gets Open link (via HA)."""
+        box = card()
+        entry = Gtk.Entry(placeholder_text="Text or link (from the clipboard)")
+        box.pack_start(entry, False, False, 0)
+        row = Gtk.Box(spacing=8, homogeneous=True)
+        box.pack_start(row, False, False, 0)
+
+        def is_link(s):
+            return s.startswith(("http://", "https://"))
+
+        def go(what):
+            s = entry.get_text().strip()
+            if not s:
+                return
+            if what != "text" and not is_link(s):
+                flash("Links must start with http:// or https://")
+                return
+
+            def done(r):
+                if r:
+                    flash({"text": "Typed on ", "link": "Link sent to ", "open": "Opening on "}[what] + d["name"])
+                    entry.set_text("")
+                else:
+                    flash(f"{d['name']}: not reachable")
+            if what == "open":
+                bg(lambda: ha.call("remote", "turn_on", {"entity_id": d["entity"], "activity": s}) or True, done)
+            else:
+                cmd = {"type": "text", "text": s} if what == "text" else {"type": "link", "url": s}
+                bg(lambda: jr_send(d["host"], cmd) or True, done)
+        buttons = [("Open link", "open")] if d["type"] == "atv" else [("Type text", "text"), ("Send link", "link")]
+        for lab, what in buttons:
+            b = Gtk.Button(label=lab)
+            b.get_style_context().add_class("art-key")
+            b.connect("clicked", lambda _b, w=what: go(w))
+            row.pack_start(b, True, True, 0)
+        # prefill from the desktop clipboard whenever the page is shown
+        box.connect("map", lambda *_: entry.get_text() or clip.request_text(
+            lambda _c, t: t and entry.set_text(t.strip()[:2000])))
+        return box
+
+    def with_share(d, page):
+        if d["type"] == "ir" or (d["type"] == "jr" and d["host"] not in jr_store()["peers"]):
+            return page
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        col.pack_start(page, False, False, 0)
+        col.pack_start(share_card(d), False, False, 0)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.add(col)
+        return sc
+
     chip_buttons = []
     for i, d in enumerate(devices):
         page = dpad_page(d, tv_rows) if d["type"] == "atv" else ir_page(d) if d["type"] == "ir" else jr_page(d)
+        page = with_share(d, page)
         dstack.add_named(page, str(i))
         cb = Gtk.ToggleButton(label=d["name"])
         cb.get_style_context().add_class("art-chip")
