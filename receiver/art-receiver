@@ -236,9 +236,29 @@ def selftest():
     print("selftest ok")
 
 
+def announce():
+    # _jointremote._tcp through avahi-daemon, as Receiver.kt does with NSD; avahi drops it when the bus connection closes
+    global avahi
+    from gi.repository import Gio, GLib
+    try:
+        b = avahi = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)  # held for the process lifetime
+        group = b.call_sync("org.freedesktop.Avahi", "/", "org.freedesktop.Avahi.Server", "EntryGroupNew",
+                            None, None, 0, 2000, None).unpack()[0]
+        st = store()
+        save(st)  # keep the announced id the same as the one pairing hands out
+        txt = [f"id={st['id']}".encode(), b"kind=desktop"]
+        g = "org.freedesktop.Avahi.EntryGroup"
+        b.call_sync("org.freedesktop.Avahi", group, g, "AddService",
+                    GLib.Variant("(iiussssqaay)", (-1, -1, 0, socket.gethostname(), "_jointremote._tcp", "", "", PORT, txt)),
+                    None, 0, 2000, None)
+        b.call_sync("org.freedesktop.Avahi", group, g, "Commit", None, None, 0, 2000, None)
+    except Exception as e:  # no avahi: senders can still add this desktop by IP
+        print("not announced:", e, file=sys.stderr)
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--selftest"]:
         selftest()
     else:
-        # shortcut: no mDNS announce (_jointremote._tcp), so senders add this desktop by IP
+        announce()
         ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
