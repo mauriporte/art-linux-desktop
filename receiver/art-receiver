@@ -250,6 +250,7 @@ def announce():
     global avahi
     from gi.repository import Gio, GLib
     try:
+        # shortcut: not re-announced if avahi-daemon restarts; restart art-receiver then, or watch Avahi's StateChanged
         b = avahi = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)  # held for the process lifetime
         group = b.call_sync("org.freedesktop.Avahi", "/", "org.freedesktop.Avahi.Server", "EntryGroupNew",
                             None, None, 0, 2000, None).unpack()[0]
