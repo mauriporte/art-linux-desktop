@@ -30,7 +30,7 @@ Without remotes.ini, the [ha] remote entity is used as a single Android TV.
 """
 import base64, configparser, hashlib, hmac, importlib.machinery, json, math, os, re, secrets, socket, subprocess, sys, \
     threading, time
-import urllib.parse, urllib.request
+import urllib.error, urllib.parse, urllib.request
 
 HA_CONF = os.path.expanduser("~/.config/art-desktop/ha.ini")
 REMOTES = os.path.expanduser("~/.config/art-desktop/remotes.ini")
@@ -149,7 +149,14 @@ def jr_send(host, cmd):
         raise RuntimeError("not paired")
     body, t, nonce = json.dumps(cmd), int(time.time() * 1000), secrets.token_urlsafe(12)
     sig = jr_sign(base64.b64decode(peer["secret"]), "POST", "/cmd", t, nonce, body)
-    jr_post(host, "/cmd", body, {"x-id": st["id"], "x-time": str(t), "x-nonce": nonce, "x-sig": sig})
+    try:
+        jr_post(host, "/cmd", body, {"x-id": st["id"], "x-time": str(t), "x-nonce": nonce, "x-sig": sig})
+    except urllib.error.HTTPError as e:
+        if e.code == 401:  # the device forgot us: drop the old secret so the Remote page offers Pair again
+            st["peers"].pop(host, None)
+            jr_save(st)
+            raise RuntimeError("not paired any more: pair again") from e
+        raise
 
 
 class HA:
