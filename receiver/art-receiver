@@ -11,7 +11,7 @@ Same protocol as Joint Remote's Receiver.kt / Auth.kt on Android:
                              {type: key, key: play_pause | next | previous}
 The player is the MPRIS one that's playing, else the first. Paired devices: ~/.config/art-desktop/receiver.json (600).
 """
-import base64, hashlib, hmac, json, os, secrets, socket, subprocess, sys, threading, time, urllib.request
+import base64, hashlib, hmac, json, os, secrets, socket, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8733
@@ -130,12 +130,21 @@ def pair_start():
             return 429, {"error": "wait a moment"}
         code = f"{secrets.randbelow(1_000_000):06d}"
         pairing.update(code=code, until=time.monotonic() + 60, tries=0)
+    return (200, {"ok": True}) if notify(code) else (503, {"error": "can't show the code here (no notification service)"})
+
+
+def notify(code):
+    # straight to the desktop's notification service: notify-send isn't always installed
+    from gi.repository import GLib
     try:
-        subprocess.Popen(["notify-send", "-u", "critical", "-t", "60000", "Joint Remote pairing code", code],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError:
-        return 503, {"error": "can't show the code here (notify-send missing)"}
-    return 200, {"ok": True}
+        bus().call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                        "org.freedesktop.Notifications", "Notify",
+                        GLib.Variant("(susssasa{sv}i)", ("Joint Remote", 0, "phone", "Joint Remote pairing code", code,
+                                                         [], {"urgency": GLib.Variant("y", 2)}, 60000)),
+                        None, 0, 2000, None)
+        return True
+    except Exception:
+        return False
 
 
 def pair_finish(j, host):
