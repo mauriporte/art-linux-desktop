@@ -138,7 +138,7 @@ def jr_pair_finish(host, code):
     st = jr_store()
     mine = {"id": st["id"], "name": socket.gethostname(), "kind": "desktop", "code": code.strip()}
     j = jr_post(host, "/pair/finish", json.dumps(mine))
-    st["peers"][host] = {"name": j.get("name", host), "secret": j["secret"]}
+    st["peers"][host] = {"name": j.get("name", host), "id": j.get("id"), "kind": j.get("kind", ""), "secret": j["secret"]}
     jr_save(st)
 
 

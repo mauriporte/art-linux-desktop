@@ -9,13 +9,14 @@ Same protocol as Joint Remote's Receiver.kt / Auth.kt on Android:
   POST /pair/finish  {id, name, kind, code} -> {id, name, kind, secret}; the code works once, for a minute, 3 tries
   POST /cmd          signed: {type: now} -> {app, title, artist, state, position, duration, updatedAt, art}
                              {type: key, key: play_pause | next | previous}
-The player is the MPRIS one that's playing, else the first. Paired devices: ~/.config/art-desktop/receiver.json (600).
+The player is the MPRIS one that's playing, else the first. Identity and paired devices are shared with art-panel
+(~/.config/art-desktop/joint-remote.json, 600), so other devices see one MauTrixie whichever side paired.
 """
 import base64, hashlib, hmac, json, os, secrets, socket, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8733
-STORE = os.path.expanduser("~/.config/art-desktop/receiver.json")
+STORE = os.path.expanduser("~/.config/art-desktop/joint-remote.json")  # art-panel's JR_STORE
 SKEW_MS = 30_000
 KEYS = {"play_pause": "PlayPause", "next": "Next", "previous": "Previous"}
 lock = threading.Lock()
@@ -158,10 +159,15 @@ def pair_finish(j, host):
             return 403, {"error": "wrong code"}
         pairing["code"] = None
         st, secret = store(), secrets.token_bytes(32)
-        st["peers"][j["id"]] = {"name": j.get("name", host), "kind": j.get("kind", ""), "host": host,
-                                "secret": base64.b64encode(secret).decode()}
+        st["peers"][host] = {"name": j.get("name", host), "id": j["id"], "kind": j.get("kind", ""),
+                             "secret": base64.b64encode(secret).decode()}
         save(st)
     return 200, {"id": st["id"], "name": socket.gethostname(), "kind": "desktop", "secret": base64.b64encode(secret).decode()}
+
+
+def peer_for(peers, pid, host):
+    # keyed by address like art-panel's; entries the panel paired before 26/10 have no id, so the address picks them
+    return next((p for p in peers.values() if p.get("id") == pid), None) or peers.get(host)
 
 
 def command(j):
@@ -192,7 +198,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(*pair_finish(j, self.client_address[0]))
             if self.path != "/cmd":
                 return self.reply(404, {"error": "not found"})
-            peer = store()["peers"].get(self.headers.get("x-id", ""))
+            peer = peer_for(store()["peers"], self.headers.get("x-id", ""), self.client_address[0])
             if not peer:
                 return self.reply(401, {"error": "not paired"})
             with lock:
@@ -233,6 +239,9 @@ def selftest():
     assert pair_finish({"id": "a", "code": "000000"}, "h")[0] == 403
     assert pair_finish({"id": "a", "code": "000001"}, "h")[0] == 403
     assert pair_finish({"id": "a", "code": "000002"}, "h")[0] == 403 and pairing["code"] is None  # 3 tries
+    peers = {"1.1.1.1": {"id": "a"}, "2.2.2.2": {}}
+    assert peer_for(peers, "a", "9.9.9.9") is peers["1.1.1.1"] and peer_for(peers, "b", "2.2.2.2") is peers["2.2.2.2"]
+    assert peer_for(peers, "b", "9.9.9.9") is None
     print("selftest ok")
 
 
