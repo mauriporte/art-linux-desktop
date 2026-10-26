@@ -46,6 +46,12 @@ remote = remote.living_room_tv
 
 The token stays in that file only. The panel polls HA every 10 s, and only while it is open.
 
+## Joint Remote receiver
+
+`art-receiver` (autostarted) answers Joint Remote devices on port 8733: they see what's playing here (any MPRIS
+player) and press play/pause, next and previous. A device pairs once with a 6-digit code shown as a notification;
+paired devices are kept in `~/.config/art-desktop/receiver.json` (mode 600). Check it with `art-receiver --selftest`.
+
 ## Uninstall
 
 ```bash

@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Joint Remote receiver for this desktop: your other devices see what's playing here and press play/pause/next/previous.
+
+  art-receiver             serve on port 8733 (autostart)
+  art-receiver --selftest  quick checks, no network
+
+Same protocol as Joint Remote's Receiver.kt / Auth.kt on Android:
+  POST /pair/start   shows a 6-digit code on this screen (a notification)
+  POST /pair/finish  {id, name, kind, code} -> {id, name, kind, secret}; the code works once, for a minute, 3 tries
+  POST /cmd          signed: {type: now} -> {app, title, artist, state, position, duration, updatedAt, art}
+                             {type: key, key: play_pause | next | previous}
+The player is the MPRIS one that's playing, else the first. Paired devices: ~/.config/art-desktop/receiver.json (600).
+"""
+import base64, hashlib, hmac, json, os, secrets, socket, subprocess, sys, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = 8733
+STORE = os.path.expanduser("~/.config/art-desktop/receiver.json")
+SKEW_MS = 30_000
+KEYS = {"play_pause": "PlayPause", "next": "Next", "previous": "Previous"}
+lock = threading.Lock()
+pairing = {"code": None, "until": 0.0, "tries": 0}
+seen = {}  # nonce -> ms, so a signed request can't be sent twice
+art_cache = {}
+
+
+def sign(secret, method, path, t, nonce, body):
+    return base64.b64encode(hmac.new(secret, f"{method}\n{path}\n{t}\n{nonce}\n{body}".encode(), hashlib.sha256).digest()).decode()
+
+
+def verify(secret, method, path, t, nonce, body, sig, now):
+    if abs(now - t) > SKEW_MS or not 8 <= len(nonce) <= 64:
+        return False
+    for n in [n for n, at in seen.items() if now - at > 2 * SKEW_MS]:
+        del seen[n]
+    if nonce in seen or not hmac.compare_digest(sign(secret, method, path, t, nonce, body), sig):
+        return False
+    seen[nonce] = now
+    return True
+
+
+def store():
+    try:
+        with open(STORE) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = {}
+    st.setdefault("id", base64.urlsafe_b64encode(secrets.token_bytes(9)).decode())
+    st.setdefault("peers", {})
+    return st
+
+
+def save(st):
+    os.makedirs(os.path.dirname(STORE), exist_ok=True)
+    fd = os.open(STORE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(st, f)
+
+
+# ---- MPRIS over the session bus (python3-gi, already there for the panel)
+def bus():
+    from gi.repository import Gio
+    return Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+
+def player(b):
+    from gi.repository import GLib
+    names = [n for n in b.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames",
+                                    None, None, 0, 2000, None).unpack()[0] if n.startswith("org.mpris.MediaPlayer2.")]
+    props = []
+    for n in sorted(names):
+        try:
+            p = b.call_sync(n, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "GetAll",
+                            GLib.Variant("(s)", ("org.mpris.MediaPlayer2.Player",)), None, 0, 2000, None).unpack()[0]
+            props.append((n, p))
+        except Exception:
+            pass
+    return next((x for x in props if x[1].get("PlaybackStatus") == "Playing"), props[0] if props else (None, None))
+
+
+def art(url):
+    """The cover, at most 256 px and JPEG 80, as a data URL (same as Joint Remote's)."""
+    if not url:
+        return None
+    if url not in art_cache:
+        from gi.repository import GdkPixbuf
+        try:
+            raw = urllib.request.urlopen(url, timeout=3).read() if url.startswith(("http://", "https://", "file://")) else b""
+            ld = GdkPixbuf.PixbufLoader()
+            ld.write(raw)
+            ld.close()
+            pb = ld.get_pixbuf()
+            s = min(1, 256 / max(pb.get_width(), pb.get_height()))
+            if s < 1:
+                pb = pb.scale_simple(max(1, int(pb.get_width() * s)), max(1, int(pb.get_height() * s)), GdkPixbuf.InterpType.BILINEAR)
+            ok, jpg = pb.save_to_bufferv("jpeg", ["quality"], ["80"])
+            art_cache.clear()  # one cover is enough
+            art_cache[url] = "data:image/jpeg;base64," + base64.b64encode(jpg).decode()
+        except Exception:
+            return None
+    return art_cache[url]
+
+
+def now_playing():
+    name, p = player(bus())
+    if not name:
+        return {"state": "none"}
+    md = p.get("Metadata", {})
+    artist = md.get("xesam:artist") or []
+    return {"app": name.split(".")[3],  # org.mpris.MediaPlayer2.<app>[.instanceN]
+            "title": md.get("xesam:title"), "artist": ", ".join(artist) if isinstance(artist, list) else artist,
+            "state": {"Playing": "playing", "Paused": "paused", "Stopped": "stopped"}.get(p.get("PlaybackStatus"), "none"),
+            "position": int(p.get("Position", 0)) // 1_000_000, "duration": int(md.get("mpris:length", 0)) // 1_000_000,
+            "updatedAt": int(time.time() * 1000), "art": art(md.get("mpris:artUrl"))}
+
+
+def press(key):
+    b = bus()
+    name, _ = player(b)
+    if not name:
+        return 409, {"error": "nothing is playing here"}
+    b.call_sync(name, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player", KEYS[key], None, None, 0, 2000, None)
+    return 200, {"ok": True}
+
+
+# ---- pairing
+def pair_start():
+    with lock:
+        if time.monotonic() < pairing["until"] - 55:  # a new code at most every 5 s, as on Android
+            return 429, {"error": "wait a moment"}
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        pairing.update(code=code, until=time.monotonic() + 60, tries=0)
+    try:
+        subprocess.Popen(["notify-send", "-u", "critical", "-t", "60000", "Joint Remote pairing code", code],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return 503, {"error": "can't show the code here (notify-send missing)"}
+    return 200, {"ok": True}
+
+
+def pair_finish(j, host):
+    with lock:
+        if not pairing["code"] or time.monotonic() > pairing["until"]:
+            return 403, {"error": "no code on screen: start pairing again"}
+        if str(j.get("code", "")) != pairing["code"]:
+            pairing["tries"] += 1
+            if pairing["tries"] >= 3:
+                pairing["code"] = None
+            return 403, {"error": "wrong code"}
+        pairing["code"] = None
+        st, secret = store(), secrets.token_bytes(32)
+        st["peers"][j["id"]] = {"name": j.get("name", host), "kind": j.get("kind", ""), "host": host,
+                                "secret": base64.b64encode(secret).decode()}
+        save(st)
+    return 200, {"id": st["id"], "name": socket.gethostname(), "kind": "desktop", "secret": base64.b64encode(secret).decode()}
+
+
+def command(j):
+    t = j.get("type")
+    if t == "now":
+        try:
+            return 200, now_playing()
+        except Exception as e:
+            return 503, {"error": f"can't read what's playing: {e}"}
+    if t == "key":
+        if j.get("key") not in KEYS:
+            return 501, {"error": f"this device can't press {j.get('key')}"}
+        return press(j["key"])
+    return 400, {"error": "unknown command"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0)
+        if not 0 <= n <= 20_000:
+            return self.reply(413, {"error": "too big"})
+        body = self.rfile.read(n).decode()
+        try:
+            j = json.loads(body or "{}")
+            if self.path == "/pair/start":
+                return self.reply(*pair_start())
+            if self.path == "/pair/finish":
+                return self.reply(*pair_finish(j, self.client_address[0]))
+            if self.path != "/cmd":
+                return self.reply(404, {"error": "not found"})
+            peer = store()["peers"].get(self.headers.get("x-id", ""))
+            if not peer:
+                return self.reply(401, {"error": "not paired"})
+            with lock:
+                good = verify(base64.b64decode(peer["secret"]), "POST", "/cmd", int(self.headers.get("x-time") or 0),
+                              self.headers.get("x-nonce", ""), body, self.headers.get("x-sig", ""), int(time.time() * 1000))
+            if not good:
+                return self.reply(401, {"error": "bad signature or clock"})
+            self.reply(*command(j))
+        except Exception as e:
+            self.reply(400, {"error": str(e) or "bad request"})
+
+    def do_GET(self):
+        self.reply(405, {"error": "POST only"})
+
+    def reply(self, status, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def log_message(self, *a):
+        pass
+
+
+def selftest():
+    k = b"k" * 32
+    s = sign(k, "POST", "/cmd", 1000, "abcdefgh", "{}")
+    assert s == base64.b64encode(hmac.new(k, b"POST\n/cmd\n1000\nabcdefgh\n{}", hashlib.sha256).digest()).decode()
+    assert not verify(k, "POST", "/cmd", 1000, "abcdefgh", '{"x":1}', s, 1000)  # body changed
+    assert not verify(k, "POST", "/cmd", 1000, "abcdefgh", "{}", s, 1000 + SKEW_MS + 1)  # stale
+    assert verify(k, "POST", "/cmd", 1000, "abcdefgh", "{}", s, 1000)
+    assert not verify(k, "POST", "/cmd", 1000, "abcdefgh", "{}", s, 1000)  # replayed
+    assert command({"type": "key", "key": "home"})[0] == 501 and command({"type": "x"})[0] == 400
+    pairing.update(code="123456", until=time.monotonic() + 60, tries=0)
+    assert pair_finish({"id": "a", "code": "000000"}, "h")[0] == 403
+    assert pair_finish({"id": "a", "code": "000001"}, "h")[0] == 403
+    assert pair_finish({"id": "a", "code": "000002"}, "h")[0] == 403 and pairing["code"] is None  # 3 tries
+    print("selftest ok")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--selftest"]:
+        selftest()
+    else:
+        # shortcut: no mDNS announce (_jointremote._tcp), so senders add this desktop by IP
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

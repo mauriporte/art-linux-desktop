@@ -7,6 +7,7 @@ BK="$DATA/backup/keys.txt"
 
 pkill -u "$USER" -f '[a]rt-flipclock' 2>/dev/null || true
 pkill -u "$USER" -f '[a]rt-panel' 2>/dev/null || true
+pkill -u "$USER" -f '[a]rt-receiver' 2>/dev/null || true
 
 if [ -f "$BK" ]; then
   while IFS=$'\t' read -r key val; do
@@ -23,6 +24,7 @@ fi
 rm -rf "$HOME/.themes/ART-Dark" "$HOME/.icons/ART-Phosphor" "$HOME/.local/share/fonts/art-desktop" "$DATA"
 rm -f "$HOME/.local/bin/art-flipclock" "$HOME/.config/autostart/art-flipclock.desktop" \
       "$HOME/.local/bin/art-panel" "$HOME/.config/autostart/art-panel.desktop" \
+      "$HOME/.local/bin/art-receiver" "$HOME/.config/autostart/art-receiver.desktop" \
       "$HOME/.local/share/applications/art-flipclock.desktop"
 fc-cache -f >/dev/null 2>&1 || true
 echo "A.R.T. look removed. Your weather setting stays in ~/.config/art-desktop (delete it if you like)."
